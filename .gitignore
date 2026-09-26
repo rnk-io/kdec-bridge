@@ -1,0 +1,22 @@
+# Build output
+.gradle/
+build/
+local.properties
+.cxx/
+captures/
+
+# IDE
+*.iml
+.idea/
+.DS_Store
+
+# Go library built by tools/build-aar.sh
+tsbridge/*.aar
+app/libs/*.aar
+app/libs/*-sources.jar
+
+# Packages and signing keys
+*.apk
+*.aab
+*.jks
+*.keystore
