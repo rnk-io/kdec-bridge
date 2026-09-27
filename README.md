@@ -81,11 +81,11 @@ Because the bridge only forwards bytes, the identity exchange and TLS handshake 
 - **Computer:** KDE Connect (`kdeconnectd`) running, and [Tailscale](https://tailscale.com/) installed and logged in.
 - **Tailscale account:** the phone joins the same tailnet as the computer.
 
-KDEC Bridge itself is not published on any app store and has no prebuilt download. Build the APK from source as described in [Building](#building).
+KDEC Bridge is not on any app store. Download the APK from the [latest release](https://github.com/rnk-io/kdec-bridge/releases/latest), or build it from source as described in [Building](#building).
 
 ## Quick start
 
-1. **Build and install the app.** See [Building](#building).
+1. **Install the app.** Download the APK from the [latest release](https://github.com/rnk-io/kdec-bridge/releases/latest) and open it on the phone. To build it yourself instead, see [Building](#building).
 2. **Find the computer's MagicDNS name.** On the computer, run:
 
    ```bash
@@ -169,7 +169,7 @@ The screen refreshes every second while it is open.
 
 ### Event log
 
-The event log is timestamped and stored in the app's private storage, so it survives the process being killed. It can also be read over USB:
+The event log is timestamped and stored in the app's private storage, so it survives the process being killed. On debug builds it can also be read over USB:
 
 ```bash
 adb shell run-as dev.kdecbridge cat files/events.log
@@ -246,7 +246,7 @@ The bridge does not poll while connected. Its injection loop sleeps until a link
 ## Limitations
 
 - 64-bit ARM (`arm64-v8a`) only.
-- No prebuilt APK is published. Building from source produces a debug-signed APK, which is installed by sideloading.
+- Not available on app stores. The APK from GitHub Releases is installed by sideloading.
 - Identity discovery requires a path on which the computer can connect back to the phone, so it does not work through a relay. tsnet and LAN connections are unaffected. In relay setups, the identity is stored once a link has been established.
 - Android requires a visible notification for foreground services. It can be hidden by turning off the app's notifications; see [docs/setup.md](docs/setup.md#8-hide-the-notification-optional).
 

@@ -29,18 +29,22 @@ flowchart LR
 **On the phone**
 
 - The official KDE Connect app, from Google Play or F-Droid.
-- KDEC Bridge has no store listing or download; you build its APK yourself in step 1.
+- KDEC Bridge is not on any app store; step 1 covers installing it.
 - Any VPN app you use can stay installed and connected.
 
 ## 1. Install the app
 
-Build the APK as described in [building.md](building.md), then install it over USB with USB debugging enabled:
+Download the APK (`kdec-bridge-v*.apk`) from the [latest release](https://github.com/rnk-io/kdec-bridge/releases/latest) and open it on the phone. Android asks for permission to install apps from that source, such as your browser or file manager.
+
+Alternatively, install it over USB with USB debugging enabled:
 
 ```bash
-adb install -r app-debug.apk
+adb install -r kdec-bridge-v0.2.apk
 ```
 
-Alternatively, copy the APK to the phone and open it. Android asks for permission to install apps from that source.
+The release page lists the file's SHA-256 checksum, which you can compare with `sha256sum` to confirm the download is intact. To build the APK yourself, see [building.md](building.md).
+
+If a copy signed with a different key is already installed, for example your own debug build, Android refuses the update. Uninstall it first; the app then needs to be set up again.
 
 ## 2. Create an auth key (optional)
 
@@ -117,7 +121,7 @@ The service keeps running without a status bar icon. Android restarts the app's 
 | Works, then stops overnight | The battery optimization exemption has not been granted |
 | Banner shows `■ KILLED BY SYSTEM` | Android or a task killer stopped the service. The event log records when it was last running |
 
-The event log can also be read over USB:
+On debug builds, the event log can also be read over USB:
 
 ```bash
 adb shell run-as dev.kdecbridge cat files/events.log

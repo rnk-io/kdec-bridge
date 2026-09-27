@@ -71,6 +71,24 @@ readelf -lW /tmp/libgojni.so | grep LOAD    # alignment column should read 0x400
 
 **ABI.** The library is built for `arm64-v8a` only, and `app/build.gradle.kts` restricts the APK to the same ABI.
 
+## Release builds
+
+A release build is not debuggable and must be signed before it can be installed. Create a signing key once, keep it outside the repository, and back it up: every update must be signed with the same key.
+
+```bash
+keytool -genkeypair -v -keystore /path/to/release.jks -alias kdec-bridge -keyalg RSA -keysize 4096 -validity 10000 -dname "CN=<publisher name>"
+```
+
+Build, sign and verify:
+
+```bash
+gradle assembleRelease
+apksigner sign --ks /path/to/release.jks --ks-key-alias kdec-bridge --out kdec-bridge-vX.Y.apk app/build/outputs/apk/release/app-release-unsigned.apk
+apksigner verify --print-certs kdec-bridge-vX.Y.apk
+```
+
+`apksigner` is in the Android SDK's `build-tools/<version>/` directory. Increase `versionCode` and `versionName` in `app/build.gradle.kts` for each release.
+
 ## Testing
 
 The service is not exported. To start the bridge without using the UI, launch the activity with the `autostart` extra:
