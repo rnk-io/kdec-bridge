@@ -1,21 +1,33 @@
 # tsbridge
 
-Go library that runs a userspace Tailscale node ([tsnet](https://pkg.go.dev/tailscale.com/tsnet)) inside the Android app and forwards KDE Connect's ports over it. It also contains the ADB client the app uses to switch adbd on the phone to TCP mode. gomobile compiles it into `app/libs/tsbridge.aar`.
+Go library that runs a userspace Tailscale node ([tsnet](https://pkg.go.dev/tailscale.com/tsnet)) inside the Android app and carries both of the bridge's services over it: it forwards KDE Connect's ports to the computer and the phone's ADB port from the tailnet. It also contains the ADB client the app uses to keep adbd in TCP mode. gomobile compiles it into `app/libs/tsbridge.aar`.
 
 tsnet runs WireGuard and a userspace TCP/IP stack in-process. It needs no TUN device, so the app does not use Android's `VpnService`.
 
 ## API
 
+**Node**
+
 | Function | Description |
 |---|---|
 | `SetNetInfo(NetInfo)` | Supplies the network interface list from Java. Call before `Start` |
-| `SetLinkWatcher(LinkWatcher)` | Registers a callback for control link up and down events |
 | `Start(...)` | Brings up the node and all listeners. Blocks until the node is authenticated, so call it off the UI thread |
 | `Stop()` | Closes everything and aborts a pending login. Safe to call when nothing is running |
 | `Status()`, `LoginURL()` | Cached node state and pending login URL. Never block |
+
+**KDE Connect**
+
+| Function | Description |
+|---|---|
+| `SetLinkWatcher(LinkWatcher)` | Registers a callback for control link up and down events |
 | `ControlPort()` | Loopback port bound for the control channel, or 0 |
 | `ControlActive()` | Number of live control connections |
 | `DiscoverIdentity(target, timeoutSec)` | Learns the computer's identity packet over the tailnet |
+
+**ADB**
+
+| Function | Description |
+|---|---|
 | `SetAdbForward(port)` | Opens a tailnet listener on `port` that forwards to adbd on loopback, or closes it when `port` is 0. Can be called before `Start` |
 | `AdbPair(keyDir, host, port, code)` | Pairs the app's ADB key with a Wireless debugging pairing service |
 | `AdbAuthorize(keyDir, host, port, timeoutSec)` | Connects to adbd's classic TCP port and, if the key is not trusted, has adbd show the "Allow USB debugging?" prompt for it |
@@ -29,10 +41,10 @@ Build with [`tools/build-aar.sh`](../tools/build-aar.sh) rather than calling `go
 
 | Ports | Listens on | Forwards to | Carries |
 |---|---|---|---|
-| 1717 (up to 1738) | Loopback | Computer, port 1716 | Control channel |
-| 1739–1743 | Loopback | Computer, same port | File transfers started by the computer |
-| 1744–1764 | Tailnet | Loopback, same port | File transfers started by the phone |
-| 5555 | Tailnet | Loopback, same port | ADB. Only while `SetAdbForward` has set it |
+| 1717 (up to 1738) | Loopback | Computer, port 1716 | KDE Connect control channel |
+| 1739–1743 | Loopback | Computer, same port | KDE Connect file transfers started by the computer |
+| 1744–1764 | Tailnet | Loopback, same port | KDE Connect file transfers started by the phone |
+| 5555 | Tailnet | Loopback, same port | ADB, to adbd. Only while `SetAdbForward` has set it |
 
 Holding the low payload ports on loopback moves KDE Connect's own payload server on the phone into the high range, where the tailnet listeners accept the computer's connections.
 

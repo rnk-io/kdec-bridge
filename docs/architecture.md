@@ -1,50 +1,64 @@
 # Architecture
 
-This document describes how KDEC Bridge connects the stock KDE Connect app to a remote computer. For installation, see [setup.md](setup.md).
+This document describes how KDEC Bridge carries KDE Connect and ADB between an Android phone and a computer over a userspace Tailscale node. For installation, see [setup.md](setup.md).
 
 - [Background](#background)
 - [Components](#components)
-- [Connection setup](#connection-setup)
-- [Computer identity](#computer-identity)
-- [File transfer](#file-transfer)
-- [Link monitoring](#link-monitoring)
-- [Service lifecycle](#service-lifecycle)
+- [KDE Connect](#kde-connect)
+  - [Connection setup](#connection-setup)
+  - [Computer identity](#computer-identity)
+  - [File transfer](#file-transfer)
+  - [Link monitoring](#link-monitoring)
 - [ADB for scrcpy](#adb-for-scrcpy)
+  - [Opening port 5555](#opening-port-5555)
+  - [When the bridge checks](#when-the-bridge-checks)
+  - [Closing port 5555](#closing-port-5555)
+  - [Trusting the app's key](#trusting-the-apps-key)
+  - [Pairing](#pairing)
+- [Service lifecycle](#service-lifecycle)
+- [Network exposure](#network-exposure)
+- [Go library](#go-library)
 
 ## Background
 
-Android allows one active `VpnService` at a time. The Tailscale app needs it, so it cannot run while another VPN app is connected, and without Tailscale, KDE Connect on the phone cannot reach a computer outside the local network.
+Android allows one active `VpnService` at a time. The Tailscale app needs it, so it cannot run while another VPN app is connected. Without it, neither direction works across networks: KDE Connect on the phone cannot reach the computer, and `adb` on the computer cannot reach the phone.
 
-KDE Connect's list of custom device addresses does not help: kdeconnect-android sends UDP announcements to those addresses but never opens a TCP connection to them. It opens TCP connections in one place, `LanLinkProvider.udpPacketReceived`:
+KDEC Bridge runs Tailscale's `tsnet` inside the app instead: WireGuard and a userspace TCP/IP stack, with no TUN device. Only sockets opened through tsnet reach the tailnet; the ordinary sockets of other apps do not. Each service therefore needs its own way to hand connections to the bridge.
+
+**KDE Connect** cannot be pointed at the tailnet. Its list of custom device addresses does not help: kdeconnect-android sends UDP announcements to those addresses but never opens a TCP connection to them. It opens TCP connections in one place, `LanLinkProvider.udpPacketReceived`:
 
 ```java
 socket = SocketFactory.getDefault().createSocket(address, tcpPort);
 ```
 
-`address` is the source of a received UDP identity packet, and `tcpPort` is the port that packet advertises. The socket is an ordinary kernel socket, so it cannot be routed into a userspace network stack. However, `NetworkHelper.isPrivateAddress()` accepts loopback addresses, so an identity packet sent from `127.0.0.1` makes KDE Connect connect to `127.0.0.1`.
+`address` is the source of a received UDP identity packet, and `tcpPort` is the port that packet advertises. The socket is an ordinary kernel socket, so it cannot be routed into a userspace network stack. However, `NetworkHelper.isPrivateAddress()` accepts loopback addresses, so an identity packet sent from `127.0.0.1` makes KDE Connect connect to `127.0.0.1`. The bridge uses loopback as the meeting point: it listens on loopback, sends KDE Connect the computer's identity from loopback, and forwards the resulting connection over the tailnet.
 
-KDEC Bridge uses loopback as the meeting point. It listens on loopback, sends KDE Connect the computer's identity from loopback, and forwards the resulting connection to the computer through a Tailscale node that runs inside the app.
+**ADB** runs in the other direction: the computer connects to adbd on the phone. The bridge accepts these connections on the tailnet and forwards them to adbd on loopback. adbd must first listen on TCP, which only an ADB client can request, so the bridge also contains a small ADB client and uses it to keep adbd in TCP mode.
 
 ## Components
 
 <p align="center">
-  <img src="images/architecture.svg" width="100%" alt="KDE Connect connects to KDEC Bridge on loopback. The bridge forwards the connection over a userspace Tailscale tunnel to kdeconnectd on the computer.">
+  <img src="images/architecture.svg" width="100%" alt="On the phone, KDEC Bridge runs a userspace Tailscale node. KDE Connect connects to the bridge on loopback, and the bridge forwards the connection to kdeconnectd on the computer. adb and scrcpy on the computer connect to the phone's tailnet address on port 5555, and the bridge forwards the connection to adbd on loopback.">
 </p>
 
-| Component | Language | Responsibility |
-|---|---|---|
-| `BridgeService` | Kotlin | Foreground service. Starts the transport, runs the injection loop, tracks link state and records heartbeats |
-| `Injector` | Kotlin | Sends identity packets to KDE Connect's UDP port on loopback |
-| `IdentityDiscovery` | Kotlin | Learns the computer's identity. Runs in Kotlin in direct mode and calls into Go in tsnet mode |
-| `PortProxy`, `DirectTcpTransport` | Kotlin | Loopback TCP forwarding in direct mode |
-| `tsbridge` | Go (gomobile) | tsnet node, loopback and tailnet listeners, identity discovery over the tailnet, and the ADB client |
-| `AdbKeeper` | Kotlin | Keeps adbd listening on TCP port 5555: opens and closes it, and decides when to open it again |
-| `AdbPairing` | Kotlin | Pairing with Wireless debugging, with the code entered in the app or in a notification |
-| `AdbServices` | Kotlin | Finds this phone's Wireless debugging services through mDNS |
-| `MainActivity` | Kotlin | Settings, controls, status and event log |
-| `EventLog` | Kotlin | Timestamped log file that survives the process being killed |
+| Component | Language | Service | Responsibility |
+|---|---|---|---|
+| `BridgeService` | Kotlin | Both | Foreground service. Starts the transport, runs the injection loop, tracks link state, records heartbeats, and tells `AdbKeeper` when to check port 5555 |
+| `tsbridge` | Go (gomobile) | Both | tsnet node, loopback and tailnet listeners, identity discovery over the tailnet, and the ADB client |
+| `MainActivity` | Kotlin | Both | Settings, controls, status and event log |
+| `EventLog` | Kotlin | Both | Timestamped log file that survives the process being killed |
+| `Injector` | Kotlin | KDE Connect | Sends identity packets to KDE Connect's UDP port on loopback |
+| `IdentityDiscovery` | Kotlin | KDE Connect | Learns the computer's identity. Runs in Kotlin in direct mode and calls into Go in tsnet mode |
+| `PortProxy`, `DirectTcpTransport` | Kotlin | KDE Connect | Loopback TCP forwarding in direct mode |
+| `AdbKeeper` | Kotlin | ADB | Keeps adbd listening on TCP port 5555: opens and closes it, and decides when to open it again |
+| `AdbPairing` | Kotlin | ADB | Pairing with Wireless debugging, with the code entered in the app or in a notification |
+| `AdbServices` | Kotlin | ADB | Finds this phone's Wireless debugging services through mDNS |
 
-## Connection setup
+## KDE Connect
+
+KDE Connect connects from the phone to the computer. The bridge presents the computer to KDE Connect on loopback and forwards each connection over the tailnet.
+
+### Connection setup
 
 ```mermaid
 sequenceDiagram
@@ -74,11 +88,11 @@ Injection stops while a link is up. When KDE Connect receives an identity packet
 
 If port 1717 is taken (KDE Connect itself falls back to 1717 when 1716 is busy), the control listener binds the next free port up to 1738, and the injected packet advertises that port instead.
 
-## Computer identity
+### Computer identity
 
 KDE Connect only completes a connection for the device it expects: the `deviceId` in the identity packet must be the one under which the computer's certificate was pinned during pairing. The bridge therefore needs the computer's real identity packet. It obtains it in two ways.
 
-### Discovery
+#### Discovery
 
 ```mermaid
 sequenceDiagram
@@ -101,15 +115,15 @@ The bridge sends the computer a probe identity that advertises a port the bridge
 
 Discovery needs a path on which the computer can connect back to the phone. It works over the tailnet and on a LAN, but not through a relay.
 
-### Adoption
+#### Adoption
 
 When a link comes up, the identity that was injected must be correct, because KDE Connect only completes the TLS handshake against the certificate pinned for that `deviceId`. If no identity is stored for the current address, the bridge stores the one in use.
 
-### Storage
+#### Storage
 
 Identities are stored per computer address, so several computers can be used by changing the address. Until an identity is stored, the bridge injects a placeholder with an all-zero device id. The placeholder matches no device and cannot pair.
 
-## File transfer
+### File transfer
 
 KDE Connect sends files over separate payload connections. The sending side opens a server socket on the first free port in 1739–1764 and tells the receiving side which port to connect to. The bridge handles the two directions differently.
 
@@ -133,7 +147,7 @@ Five loopback ports are enough in practice, because `kdeconnectd` takes the firs
 
 In direct mode, the bridge forwards the full range 1739–1764 from loopback to the computer, adding the configured payload port offset.
 
-## Link monitoring
+### Link monitoring
 
 The injection loop runs on its own thread and does not poll while connected.
 
@@ -157,28 +171,9 @@ Link changes are reported by `PortProxy` in direct mode and by the Go `LinkWatch
 
 A `ConnectivityManager` network callback wakes the loop when the phone changes networks.
 
-## Service lifecycle
-
-```mermaid
-stateDiagram-v2
-    direction LR
-    state "Killed by system" as Killed
-    [*] --> Stopped
-    Stopped --> Running: Start bridge
-    Running --> Stopped: Stop bridge (cleanStop = true)
-    Running --> Killed: Process ended without a stop request
-    Killed --> Running: App opened or phone restarted
-```
-
-- The service is a foreground service with the `specialUse` type.
-- On start, it sets `enabled` and clears `cleanStop`. A stop from the app or the notification sets `cleanStop`.
-- Every pass of the injection loop records a heartbeat, at least every 120 seconds.
-- When the app starts and finds the bridge enabled but not running, and `cleanStop` is not set, the service was killed. The app writes one log entry dated from the last heartbeat and restarts the bridge.
-- `BootReceiver` restarts the bridge after a reboot or an app update if it was enabled.
-- If tsnet fails to start, for example at boot before the network is available, the start is retried with exponential backoff from 5 to 60 seconds.
-- Stopping tsnet closes sockets and can abort a pending login, so it runs off the main thread; a following start waits for it to finish.
-
 ## ADB for scrcpy
+
+ADB connects from the computer to the phone. The bridge accepts each connection on the tailnet, forwards it to adbd on loopback, and keeps adbd in TCP mode so that there is a port to forward to.
 
 adbd, the ADB daemon on the phone, listens on TCP port 5555 after `adb tcpip 5555` and stops after `adb usb` or a restart. Only an ADB client can make these requests. Android 11 added Wireless debugging, which accepts TLS connections from trusted keys while the phone is on Wi-Fi. KDEC Bridge has its own key trusted once, and from then on acts as an ADB client to adbd on the same phone. No computer is involved after that.
 
@@ -284,12 +279,45 @@ Each message is prefixed by a 6-byte header: version (1), type (0 for SPAKE2, 1 
 
 The app's key is a 2048-bit RSA key, created on first use and stored in the app's private storage (`files/adb/adbkey`), which is excluded from backups. Its name, shown on the prompt and under **Paired devices** in Wireless debugging, is `kdec-bridge@android`.
 
-### Exposure
+## Service lifecycle
 
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Killed by system" as Killed
+    [*] --> Stopped
+    Stopped --> Running: Start bridge
+    Running --> Stopped: Stop bridge (cleanStop = true)
+    Running --> Killed: Process ended without a stop request
+    Killed --> Running: App opened or phone restarted
+```
+
+- The service is a foreground service with the `specialUse` type.
+- On start, it sets `enabled` and clears `cleanStop`. A stop from the app or the notification sets `cleanStop`.
+- Every pass of the injection loop records a heartbeat, at least every 120 seconds.
+- When the app starts and finds the bridge enabled but not running, and `cleanStop` is not set, the service was killed. The app writes one log entry dated from the last heartbeat and restarts the bridge.
+- `BootReceiver` restarts the bridge after a reboot or an app update if it was enabled.
+- While it runs, the service registers a callback for Wi-Fi networks and an observer on the USB debugging setting, so that `AdbKeeper` can open port 5555 again when possible. See [When the bridge checks](#when-the-bridge-checks).
+- If tsnet fails to start, for example at boot before the network is available, the start is retried with exponential backoff from 5 to 60 seconds.
+- Stopping tsnet closes sockets and can abort a pending login, so it runs off the main thread; a following start waits for it to finish.
+
+## Network exposure
+
+| Listener | Interface | Accepts connections from | When |
+|---|---|---|---|
+| 1717 (up to 1738), 1739–1743 | Loopback | Apps on the phone, meaning KDE Connect | While the bridge runs |
+| 1744–1764 | Tailnet | Tailnet peers: the computer, for file transfers | While the bridge runs |
+| 1725–1738 | Tailnet | The computer, connecting back during identity discovery | During discovery |
+| 5555 (bridge) | Tailnet | Tailnet peers: `adb` and scrcpy | While TCP ADB is on |
+| 5555 (adbd) | All interfaces | Any network the phone is on | While TCP ADB is on |
+
+In direct mode, all KDE Connect listeners are on loopback, and the bridge opens no tailnet listeners.
+
+- Loopback listeners accept connections from any app on the phone. KDE Connect's TLS session and certificate pinning still apply end to end, so a connection from another app cannot impersonate the computer.
 - adbd in TCP mode listens on all interfaces, not only on loopback and the tailnet. Classic ADB over TCP authenticates keys but does not encrypt; traffic through the tailnet is encrypted by WireGuard.
 - Computers connecting on port 5555 must be allowed on the phone, as with USB.
 - The app connects only to adbd on the phone itself. It does not connect to other devices' ADB services.
 
 ## Go library
 
-The Android-specific problems solved in `tsbridge`, such as network interface enumeration, the log state directory and panics across JNI, are described in [tsbridge/README.md](../tsbridge/README.md).
+The Go library's Android-specific behavior, such as network interface enumeration, the log state directory and panics across JNI, and its ADB client are described in [tsbridge/README.md](../tsbridge/README.md).
