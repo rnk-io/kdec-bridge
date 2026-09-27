@@ -45,10 +45,11 @@ var (
 )
 
 var (
-	mu        sync.Mutex // guards srv, listeners, upCancel
+	mu        sync.Mutex // guards srv, listeners, upCancel, ready, adbLn
 	srv       *tsnet.Server
 	listeners []net.Listener
 	upCancel  context.CancelFunc
+	ready     bool // node is up and its listeners are bound
 
 	ctrlAlive   atomic.Int64
 	stopping    atomic.Bool
@@ -207,6 +208,13 @@ func Start(stateDir, authKey, hostname, target string,
 		}
 	}
 	logf("reverse tailnet :%d-%d -> loopback", revFirst, revLast)
+
+	ready = true
+	if p := int(adbWant.Load()); p > 0 {
+		if err := openAdbLocked(s, p); err != nil {
+			logf("adb: tailnet :%d not available - %v", p, err)
+		}
+	}
 	return nil
 }
 
@@ -471,6 +479,8 @@ func Stop() {
 	srv = nil
 	listeners = nil
 	upCancel = nil
+	ready = false
+	closeAdbLocked()
 	mu.Unlock()
 
 	if cancel != nil {

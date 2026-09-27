@@ -28,6 +28,9 @@ class Config(private val ctx: Context) {
         const val FWD_LAST = 1743
         const val REV_FIRST = 1744
 
+        /** adbd's TCP port, as set by `adb tcpip 5555`. */
+        const val ADB_PORT = 5555
+
         const val MODE_DIRECT = "direct"
         const val MODE_TSNET = "tsnet"
 
@@ -125,6 +128,19 @@ class Config(private val ctx: Context) {
         get() = if (learnedIdentity(host) != null) "learned" else "not learned"
 
     fun isLearned(): Boolean = learnedIdentity(host) != null
+
+    // ---- ADB for scrcpy -----------------------------------------------------
+
+    /** Keep adbd listening on TCP port 5555 and forward it from the tailnet. */
+    var adbTcp: Boolean
+        get() = p.getBoolean("adbTcp", false)
+        set(v) = p.edit().putBoolean("adbTcp", v).apply()
+
+    /** Whether adbd trusts the app's ADB key, through pairing with Wireless
+     *  debugging or the "Allow USB debugging?" prompt. */
+    var adbAuthorized: Boolean
+        get() = p.getBoolean("adbAuthorized", false)
+        set(v) = p.edit().putBoolean("adbAuthorized", v).apply()
 
     // ---- service state ------------------------------------------------------
 

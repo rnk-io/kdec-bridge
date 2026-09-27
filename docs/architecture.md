@@ -9,6 +9,7 @@ This document describes how KDEC Bridge connects the stock KDE Connect app to a 
 - [File transfer](#file-transfer)
 - [Link monitoring](#link-monitoring)
 - [Service lifecycle](#service-lifecycle)
+- [ADB for scrcpy](#adb-for-scrcpy)
 
 ## Background
 
@@ -36,7 +37,10 @@ KDEC Bridge uses loopback as the meeting point. It listens on loopback, sends KD
 | `Injector` | Kotlin | Sends identity packets to KDE Connect's UDP port on loopback |
 | `IdentityDiscovery` | Kotlin | Learns the computer's identity. Runs in Kotlin in direct mode and calls into Go in tsnet mode |
 | `PortProxy`, `DirectTcpTransport` | Kotlin | Loopback TCP forwarding in direct mode |
-| `tsbridge` | Go (gomobile) | tsnet node, loopback and tailnet listeners, and identity discovery over the tailnet |
+| `tsbridge` | Go (gomobile) | tsnet node, loopback and tailnet listeners, identity discovery over the tailnet, and the ADB client |
+| `AdbKeeper` | Kotlin | Keeps adbd listening on TCP port 5555: opens and closes it, and decides when to open it again |
+| `AdbPairing` | Kotlin | Pairing with Wireless debugging, with the code entered in the app or in a notification |
+| `AdbServices` | Kotlin | Finds this phone's Wireless debugging services through mDNS |
 | `MainActivity` | Kotlin | Settings, controls, status and event log |
 | `EventLog` | Kotlin | Timestamped log file that survives the process being killed |
 
@@ -170,9 +174,121 @@ stateDiagram-v2
 - On start, it sets `enabled` and clears `cleanStop`. A stop from the app or the notification sets `cleanStop`.
 - Every pass of the injection loop records a heartbeat, at least every 120 seconds.
 - When the app starts and finds the bridge enabled but not running, and `cleanStop` is not set, the service was killed. The app writes one log entry dated from the last heartbeat and restarts the bridge.
-- `BootReceiver` restarts the bridge after a reboot if it was enabled.
+- `BootReceiver` restarts the bridge after a reboot or an app update if it was enabled.
 - If tsnet fails to start, for example at boot before the network is available, the start is retried with exponential backoff from 5 to 60 seconds.
 - Stopping tsnet closes sockets and can abort a pending login, so it runs off the main thread; a following start waits for it to finish.
+
+## ADB for scrcpy
+
+adbd, the ADB daemon on the phone, listens on TCP port 5555 after `adb tcpip 5555` and stops after `adb usb` or a restart. Only an ADB client can make these requests. Android 11 added Wireless debugging, which accepts TLS connections from trusted keys while the phone is on Wi-Fi. KDEC Bridge has its own key trusted once, and from then on acts as an ADB client to adbd on the same phone. No computer is involved after that.
+
+```mermaid
+flowchart LR
+    c["adb / scrcpy<br/>(computer)"] -->|"tailnet"| l
+    subgraph phone["Phone"]
+        direction LR
+        k["AdbKeeper"] -->|"adb_wifi_enabled"| set["Settings"]
+        k -->|"mDNS lookup"| nsd["NsdManager"]
+        k -->|"AdbExec<br/>tcpip:5555, usb:"| g["tsbridge<br/>ADB client"] -->|"TLS or<br/>RSA challenge"| d["adbd"]
+        l["Tailnet listener :5555<br/>(tsbridge)"] -->|"127.0.0.1:5555"| d
+    end
+```
+
+The tailnet listener forwards connections to `127.0.0.1:5555` unchanged, like the other reverse listeners. It exists only while TCP ADB is on in the app and the transport is tsnet.
+
+### Opening port 5555
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as AdbKeeper
+    participant S as Settings
+    participant N as NsdManager
+    participant D as adbd
+    K->>K: Port 5555 closed, TCP ADB on, phone on Wi-Fi
+    K->>S: adb_wifi_enabled = 1
+    S->>D: Start Wireless debugging (TLS on a random port)
+    D-->>N: Advertise _adb-tls-connect._tcp
+    K->>N: Discover and resolve; keep the service on this phone
+    K->>D: CNXN, STLS, TLS 1.3 handshake with the app's key
+    K->>D: OPEN tcpip:5555
+    D-->>K: restarting in TCP mode port: 5555
+    D->>D: Restart and listen on :5555
+    K->>S: adb_wifi_enabled = 0, if it was off before
+```
+
+- `adb_wifi_enabled` is a secure setting. Once its key is trusted, the app grants itself `WRITE_SECURE_SETTINGS` by running `pm grant` over its first ADB connection.
+- adbd picks a random port for Wireless debugging and advertises it only through mDNS. Other devices on the network advertise the same service type, so only a service that resolves to one of the phone's own addresses is used. The client connects over loopback and falls back to the advertised address.
+- Turning Wireless debugging off, leaving Wi-Fi and changing networks do not close port 5555. A restart does, and so does turning USB debugging off.
+- Android allows Wireless debugging only on Wi-Fi networks the user has allowed. On any other network it sets `adb_wifi_enabled` back to 0 at once. With the screen unlocked it also asks the user, so the bridge waits up to 30 seconds for an answer. With the screen locked it does not ask, so the attempt ends immediately, and automatic attempts skip that network until it reconnects or TCP ADB is turned on from the app.
+
+### When the bridge checks
+
+| Trigger | Source |
+|---|---|
+| Service start, including after a reboot or an app update | `BridgeService.startBridge` |
+| The phone joins a Wi-Fi network | `ConnectivityManager` callback for Wi-Fi networks |
+| USB debugging is turned on or off | `ContentObserver` on `adb_enabled`, 3 seconds after the change |
+| At most every 10 minutes | Injection loop |
+| **Turn on TCP ADB** | Button; also retries a network that was refused |
+
+Every check first connects to `127.0.0.1:5555` and stops there if adbd accepts. Checks run one at a time on a single worker thread. The bridge never turns USB debugging on; while it is off, the check reports `USB debugging is off` and waits for the setting to change.
+
+### Closing port 5555
+
+**Turn off TCP ADB** closes the tailnet listener, connects to `127.0.0.1:5555` with the app's key, answers adbd's RSA challenge and sends `usb:`, the request behind `adb usb`. adbd restarts in USB-only mode. If port 5555 refuses the key, the app sends `usb:` over Wireless debugging instead. It then sets `adb_wifi_enabled` to 0 and clears the setting that keeps TCP ADB on, so no later check opens the port again.
+
+### Trusting the app's key
+
+adbd keeps one list of trusted keys for USB, classic TCP and Wireless debugging. A key allowed through the "Allow USB debugging?" prompt with **Always allow** is also accepted by Wireless debugging. The app can get its key trusted in two ways:
+
+| Method | Needs | How |
+|---|---|---|
+| Prompt | Port 5555 already open, for example after `adb tcpip 5555` from a computer | The app connects to `127.0.0.1:5555`, answers the RSA challenge, and offers its public key when the signature is refused. adbd shows the prompt; once the user allows it, adbd sends CNXN |
+| Pairing | Wireless debugging on, Android 11 or later | Pairing with a six-digit code, below |
+
+After the prompt, adbd reloads its key list a moment later, so the app retries its first connection for a few seconds. If the key is still refused, **Always allow** was not ticked, and the app asks the user to repeat the prompt.
+
+### Pairing
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant S as Settings
+    participant P as AdbPairing
+    participant D as adbd pairing service
+    U->>S: Pair device with pairing code
+    S->>D: Start pairing service (random port, six-digit code)
+    D-->>P: Advertise _adb-tls-pairing._tcp
+    U->>P: Code, entered in the app
+    P->>D: TLS 1.3, client certificate with the app's key
+    P->>D: SPAKE2 message (password = code + exported keying material)
+    D-->>P: SPAKE2 message
+    P->>D: Peer info, encrypted: the app's public key
+    D-->>P: Peer info, encrypted: the device GUID
+    P->>D: pm grant WRITE_SECURE_SETTINGS (over Wireless debugging)
+```
+
+Some phones close the pairing dialog, and stop the pairing service, as soon as Settings loses focus, including when the notification shade is pulled down. The code is therefore entered in the app with both apps in split screen. Where the dialog stays open, the reply field of a notification also takes it.
+
+The pairing protocol follows adb's implementation:
+
+1. The client opens a TLS 1.3 connection to the pairing port and presents a self-signed certificate for its RSA key.
+2. Both sides export 64 bytes of keying material from the TLS session with the label `adb-label\0`. The SPAKE2 password is the pairing code followed by these bytes, which binds the code to the TLS session.
+3. Both sides exchange SPAKE2 messages over edwards25519, compatible with BoringSSL's `SPAKE2_*` functions, with the names `adb pair client` and `adb pair server`.
+4. HKDF-SHA256 derives an AES-128-GCM key from the SPAKE2 key, with the info string `adb pairing_auth aes-128-gcm key`.
+5. Each side sends an encrypted 8192-byte peer info block. The app sends its public key in adb's format; adbd replies with its GUID. A wrong code makes decryption fail, and adbd closes the connection.
+
+Each message is prefixed by a 6-byte header: version (1), type (0 for SPAKE2, 1 for peer info) and the payload length in big-endian order.
+
+The app's key is a 2048-bit RSA key, created on first use and stored in the app's private storage (`files/adb/adbkey`), which is excluded from backups. Its name, shown on the prompt and under **Paired devices** in Wireless debugging, is `kdec-bridge@android`.
+
+### Exposure
+
+- adbd in TCP mode listens on all interfaces, not only on loopback and the tailnet. Classic ADB over TCP authenticates keys but does not encrypt; traffic through the tailnet is encrypted by WireGuard.
+- Computers connecting on port 5555 must be allowed on the phone, as with USB.
+- The app connects only to adbd on the phone itself. It does not connect to other devices' ADB services.
 
 ## Go library
 

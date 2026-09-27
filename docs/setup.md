@@ -39,7 +39,7 @@ Download the APK (`kdec-bridge-v*.apk`) from the [latest release](https://github
 Alternatively, install it over USB with USB debugging enabled:
 
 ```bash
-adb install -r kdec-bridge-v0.2.apk
+adb install -r kdec-bridge-v0.3.apk
 ```
 
 The release page lists the file's SHA-256 checksum, which you can compare with `sha256sum` to confirm the download is intact. To build the APK yourself, see [building.md](building.md).
@@ -110,6 +110,64 @@ Android requires a foreground service to show a notification and does not let ap
 
 The service keeps running without a status bar icon. Android restarts the app's process when this permission changes, so open the app once afterwards. The app asks for notification permission only once, so the setting is kept.
 
+## 9. ADB for scrcpy (optional)
+
+This lets `adb` and [scrcpy](https://github.com/Genymobile/scrcpy) on the computer reach the phone over the tailnet. For the bridge to open the ADB port by itself, the phone needs Android 11 or later.
+
+**Prepare the phone**
+
+1. Enable Developer options: in **Settings → About phone**, tap **Build number** seven times. On some phones it is under **Software information**. Then turn on **USB debugging** in **Developer options**.
+2. Connect to Wi-Fi. In **Developer options → Wireless debugging**, turn Wireless debugging on. When Android asks, tick **Always allow on this network** and allow it. The bridge can open the ADB port by itself only on networks allowed this way. Wireless debugging can be turned off again afterwards; the bridge turns it on for a moment when it needs it.
+
+**Allow the app's ADB key**
+
+The bridge needs adbd to trust its own ADB key. This is done once, in either of these ways.
+
+*From a computer*, which is the simplest:
+
+1. Connect the phone by USB and run:
+
+   ```bash
+   adb tcpip 5555
+   ```
+
+2. In KDEC Bridge, tap **Turn on TCP ADB**.
+3. The phone shows **Allow USB debugging?** for `kdec-bridge@android`. Tick **Always allow from this computer** and tap **Allow**. Without the tick, the key is allowed for one connection only, and the app asks you to try again.
+
+*By pairing with Wireless debugging*, without a computer:
+
+1. In KDEC Bridge, tap **Turn on TCP ADB**. The app shows the pairing steps.
+2. Open Settings and KDEC Bridge in split screen. In Settings, open **Developer options → Wireless debugging** and tap **Pair device with pairing code**.
+3. Enter the six-digit code in the KDEC Bridge dialog and tap **Pair**.
+
+Some phones close the pairing dialog as soon as Settings loses focus, including when the notification shade is pulled down, which is why split screen is needed. Where the dialog stays open, the code can also be entered in the reply field of the KDEC Bridge notification.
+
+Either way, the status then shows `adb : on - :5555 open, forwarded from the tailnet`.
+
+**On the computer**
+
+1. Install scrcpy, which uses `adb`.
+2. Connect to the phone by its tailnet name, which is the **Tailnet node name** set in the app:
+
+   ```bash
+   adb connect kdec-bridge.your-tailnet.ts.net:5555
+   ```
+
+   The first time, the phone asks to allow debugging from the computer, unless the computer has already been allowed over USB. Tick **Always allow from this computer** and allow it.
+3. Start scrcpy:
+
+   ```bash
+   scrcpy -s kdec-bridge.your-tailnet.ts.net:5555
+   ```
+
+   If the connection goes through a Tailscale relay, lower the bit rate and size, for example `--video-bit-rate=4M --max-size=1600`.
+
+**Turning it off**
+
+Tap **Turn off TCP ADB**. Port 5555 closes on every network, Wireless debugging is turned off, and the bridge stops opening the port. Turning off USB debugging also closes port 5555; when USB debugging is turned on again, the bridge opens the port the next time the phone is on an allowed Wi-Fi network.
+
+While TCP ADB is on, port 5555 is open on every network the phone uses, including public Wi-Fi. Computers still need to be allowed on the phone, so decline any debugging request you do not recognize. If the tailnet is shared, restrict port 5555 on the phone to your computer with a Tailscale access rule.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
@@ -120,6 +178,15 @@ The service keeps running without a status bar icon. Android restarts the app's 
 | Connects, but KDE Connect does not pair | The stored identity does not match this computer. Tap **Forget learned identity** and restart the bridge |
 | Works, then stops overnight | The battery optimization exemption has not been granted |
 | Banner shows `■ KILLED BY SYSTEM` | Android or a task killer stopped the service. The event log records when it was last running |
+| `adb : waiting for Wi-Fi` | Port 5555 is closed, and opening it needs Wi-Fi. Connect to a Wi-Fi network allowed for Wireless debugging |
+| `adb : Wireless debugging is not allowed on this Wi-Fi network …` | In Developer options, turn on Wireless debugging once on this network and tick **Always allow on this network**. Or tap **Turn on TCP ADB** with the screen unlocked and allow the network |
+| `adb : USB debugging is off` | Turn on USB debugging in Developer options |
+| `adb : key not allowed yet` | Tap **Turn on TCP ADB** and allow the app's key, as described in step 9 |
+| `adb : … allowed once only …` | **Always allow** was not ticked on the prompt. Tap **Turn on TCP ADB** again and tick it |
+| `adb : … no longer allowed …` | The phone's debugging authorizations were revoked. Tap **Turn on TCP ADB** and allow the key again |
+| `pairing service not found` | Settings closed the pairing dialog before the code was entered. Pair in split screen |
+| `adb connect` times out | TCP ADB is off, or the bridge is not running. Check the `adb` line in the status |
+| `adb connect` reports `unauthorized` | Unlock the phone and allow debugging from the computer |
 
 On debug builds, the event log can also be read over USB:
 

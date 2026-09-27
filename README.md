@@ -15,6 +15,8 @@ KDE Connect works on the local network. To reach a computer from elsewhere, the 
 
 KDEC Bridge removes the conflict. It runs a Tailscale node inside the app, in userspace and without a VPN interface, and presents the computer to KDE Connect as a device on the local network. KDE Connect's encryption and pairing are unchanged.
 
+The same tunnel can also carry ADB, so that `adb` and [scrcpy](https://github.com/Genymobile/scrcpy) on the computer reach the phone from any network.
+
 <p align="center">
   <img src="docs/images/architecture.svg" width="100%" alt="KDE Connect connects to KDEC Bridge on loopback. The bridge forwards the connection over a userspace Tailscale tunnel to kdeconnectd on the computer. TLS runs end to end.">
 </p>
@@ -27,6 +29,7 @@ KDEC Bridge removes the conflict. It runs a Tailscale node inside the app, in us
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Status and diagnostics](#status-and-diagnostics)
+- [ADB for scrcpy](#adb-for-scrcpy)
 - [Transports](#transports)
 - [Ports](#ports)
 - [Battery use](#battery-use)
@@ -45,8 +48,9 @@ KDEC Bridge removes the conflict. It runs a Tailscale node inside the app, in us
 - **End-to-end encryption.** KDE Connect's TLS session and certificate pinning pass through the bridge unchanged. The bridge cannot read the traffic.
 - **Automatic identity setup.** Learns the computer's KDE Connect identity from the computer itself. Several computers can be used.
 - **All plugins, including file transfer** in both directions.
+- **ADB over the tailnet (optional).** Keeps ADB listening on TCP port 5555 and forwards it from the tailnet, so that `adb` and scrcpy on the computer can reach the phone. Turns it back on by itself after a restart.
 - **Low battery use.** Event-driven, with no polling, wakelocks or alarms.
-- **Recovers on its own.** Restarts after a reboot and records when Android stops the service.
+- **Recovers on its own.** Restarts after a reboot or an app update, and records when Android stops the service.
 
 ## How it works
 
@@ -98,7 +102,7 @@ KDEC Bridge is not on any app store. Download the APK from the [latest release](
 5. **Allow background operation.** Tap **Exempt from battery optimization** and confirm.
 6. **Pair.** Open KDE Connect on the phone. The computer appears as an available device; pair it as usual. Devices that were already paired reconnect automatically.
 
-The banner turns green (`● CONNECTED`) once KDE Connect is linked. See [docs/setup.md](docs/setup.md) for the full walkthrough and troubleshooting.
+The banner turns green (`● CONNECTED`) once KDE Connect is linked. See [docs/setup.md](docs/setup.md) for the full walkthrough and troubleshooting. To use scrcpy over the tailnet, see [ADB for scrcpy](#adb-for-scrcpy).
 
 ## Configuration
 
@@ -123,6 +127,8 @@ All settings are on the app's main screen, in the order listed.
 | Forget learned identity | Deletes the stored identity for the current address. Use this when the computer's KDE Connect identity has changed, for example after a reinstall |
 | Inject once (test) | Sends a single identity packet to KDE Connect, for diagnostics |
 | Exempt from battery optimization | Opens the system dialog. Required for reliable background operation |
+| Turn on TCP ADB | Opens ADB on port 5555, forwards it from the tailnet and keeps it on. The first time, asks you to allow the app's ADB key. See [ADB for scrcpy](#adb-for-scrcpy) |
+| Turn off TCP ADB | Closes port 5555 on every network, turns Wireless debugging off and stops turning TCP ADB back on. KDE Connect is not affected |
 
 ## Status and diagnostics
 
@@ -164,6 +170,7 @@ stateDiagram-v2
 | `started` | When the service started |
 | `last beat` | Last heartbeat. After an unexpected stop, this is when the service was last running |
 | `battery` | `exempt`, or a warning that Doze may stop the service |
+| `adb` | `off`, `on - :5555 open, forwarded from the tailnet`, or why port 5555 is closed, for example `waiting for Wi-Fi` |
 
 The screen refreshes every second while it is open.
 
@@ -194,6 +201,54 @@ adb shell run-as dev.kdecbridge cat files/events.log
 | `port N busy, control channel on :M` | The preferred port was taken; KDE Connect is given the port in use |
 | `!! previous session ended unexpectedly - last alive HH:MM:SS` | Written at the next launch after the service was killed. Check for this line first if the bridge keeps stopping |
 | `restarting bridge after unexpected death` | The bridge was restarted automatically |
+| `adb: tailnet :5555 -> 127.0.0.1:5555 open` | The tailnet listener for ADB is ready |
+| `adb: tailnet connection -> 127.0.0.1:5555` | `adb` or scrcpy on the computer connected |
+| `adb: key allowed on the phone` | The app's key was allowed through the "Allow USB debugging?" prompt |
+| `adb: paired with Wireless debugging` | The app's key was paired with Wireless debugging |
+| `adb: granted WRITE_SECURE_SETTINGS` | The app can now switch Wireless debugging on and off |
+| `adb: turning TCP ADB on (…)` | Port 5555 was closed and the bridge is opening it, with the reason, for example `Wi-Fi connected` |
+| `adb: TCP ADB on, :5555 open` | adbd is listening on port 5555 |
+| `adb: waiting for Wi-Fi` | Port 5555 is closed, and opening it needs Wi-Fi |
+| `adb: Wireless debugging is not allowed on this Wi-Fi network …` | Android refused Wireless debugging on this network. Allow it once in Developer options |
+| `adb: TCP ADB off, :5555 closed` | TCP ADB was turned off from the app |
+
+## ADB for scrcpy
+
+KDEC Bridge can keep ADB listening on TCP port 5555 and forward that port from the tailnet. `adb` and [scrcpy](https://github.com/Genymobile/scrcpy) on the computer then reach the phone through the tailnet, from any network, and the phone's VPN slot stays free.
+
+```mermaid
+flowchart LR
+    c["adb / scrcpy<br/>(computer)"] -->|"phone:5555<br/>over the tailnet"| l["Tailnet listener :5555<br/>(KDEC Bridge)"] -->|"127.0.0.1:5555"| d["adbd<br/>(phone)"]
+```
+
+On the computer:
+
+```bash
+adb connect kdec-bridge.your-tailnet.ts.net:5555
+scrcpy -s kdec-bridge.your-tailnet.ts.net:5555
+```
+
+Use the phone's tailnet name, which is the **Tailnet node name** set in the app. The phone asks once to allow debugging from the computer.
+
+An app cannot switch adbd to TCP mode by itself. Once adbd trusts the app's own ADB key, the bridge connects to adbd on the phone as an ADB client and sends the same request as `adb tcpip 5555`. Port 5555 then stays open on every network until the phone restarts or USB debugging is turned off.
+
+The key has to be allowed once, in one of two ways:
+
+- **From a computer.** Connect the phone by USB, run `adb tcpip 5555`, then tap **Turn on TCP ADB** and allow the "Allow USB debugging?" prompt with **Always allow** ticked.
+- **By pairing with Wireless debugging.** No computer is needed. Open Settings and KDEC Bridge in split screen, tap **Pair device with pairing code** in Settings, and enter the code in the app.
+
+While TCP ADB is on in the app, the bridge checks port 5555 when the service starts (including after a reboot or an app update), when the phone joins a Wi-Fi network, when USB debugging is turned on, and every 10 minutes. If the port is closed, the bridge opens it again. This needs:
+
+- **Wi-Fi.** Android allows Wireless debugging only on Wi-Fi. Once port 5555 is open, it stays open on mobile data and on other networks.
+- **A Wi-Fi network allowed for Wireless debugging.** Android asks once per network; tick **Always allow on this network**. On a network that is not allowed, Android refuses while the screen is locked and asks while it is unlocked.
+- **USB debugging on.** Turning USB debugging off closes port 5555. The bridge never turns USB debugging on.
+- **Android 11 or later.** On Android 8 to 10, which have no Wireless debugging, run `adb tcpip 5555` from a computer after each restart. The tailnet forward still works.
+
+**Turn off TCP ADB** closes port 5555 on every network, turns Wireless debugging off and stops the bridge from opening the port again.
+
+Tested on Android 16 with a full-tunnel VPN active: scrcpy over the tailnet on Wi-Fi, `adb` over the tailnet on mobile data, and TCP ADB turned back on automatically when Wi-Fi reconnected with the screen locked.
+
+Setup steps are in [docs/setup.md](docs/setup.md#9-adb-for-scrcpy-optional). The protocol and the conditions for turning TCP ADB back on are described in [docs/architecture.md](docs/architecture.md#adb-for-scrcpy).
 
 ## Transports
 
@@ -218,6 +273,9 @@ Tested on Android 16 with KDE Connect 26.08 on the computer. With Wi-Fi disabled
 | 1725–1738 | Tailnet or LAN | Temporary listener during identity discovery |
 | 1739–1743 | Loopback | File transfers started by the computer |
 | 1744–1764 | Tailnet | File transfers started by the phone |
+| 5555 | Tailnet | ADB, forwarded to adbd on loopback. Only while TCP ADB is on |
+
+While TCP ADB is on, adbd itself listens on port 5555 on all interfaces, not only on loopback.
 
 The file transfer range is split by direction. Holding 1739–1743 on loopback moves KDE Connect's own transfer server on the phone to port 1744 or higher, where the tailnet listeners accept the computer's connections. In direct mode, the bridge forwards the full range 1739–1764 from loopback. See [docs/architecture.md](docs/architecture.md#file-transfer).
 
@@ -241,13 +299,16 @@ The bridge does not poll while connected. Its injection loop sleeps until a link
 - **No telemetry.** Apart from connections to the computer, all network traffic is Tailscale's own: coordination, NAT traversal and DERP relays. Tailscale's diagnostic log upload is disabled.
 - **Credentials.** The auth key is removed from the app's settings once the node has registered. The node's keys are kept in the app's private storage.
 - **Backups.** App data is excluded from Android cloud backups and device-to-device transfers, so node keys and learned identities stay on the phone.
-- **Exposure.** In tsnet mode, nothing listens on a public interface. Loopback listeners accept connections only from the phone itself, and tailnet listeners only from the tailnet.
+- **Exposure.** In tsnet mode, the bridge listens on no public interface. Loopback listeners accept connections only from the phone itself, and tailnet listeners only from the tailnet.
+- **TCP ADB.** While TCP ADB is on, adbd accepts connections on port 5555 on every network the phone is connected to, not only through the tailnet. Each computer still has to be allowed on the phone. Classic ADB over TCP is authenticated but not encrypted; through the tailnet, WireGuard encrypts it. If the tailnet is shared, restrict port 5555 on the phone to your computer with a Tailscale access rule. Tap **Turn off TCP ADB** when it is not needed.
+- **ADB key.** The app creates its own ADB key on the phone and keeps it in private storage. It uses the key only to connect to adbd on the phone itself. The `WRITE_SECURE_SETTINGS` permission is granted to the app over ADB once its key is trusted, and is used only to switch Wireless debugging on and off.
 
 ## Limitations
 
 - 64-bit ARM (`arm64-v8a`) only.
 - Not available on app stores. The APK from GitHub Releases is installed by sideloading.
 - Identity discovery requires a path on which the computer can connect back to the phone, so it does not work through a relay. tsnet and LAN connections are unaffected. In relay setups, the identity is stored once a link has been established.
+- Turning TCP ADB back on automatically needs Android 11 or later and a Wi-Fi network allowed for Wireless debugging. After a restart on mobile data only, port 5555 stays closed until the phone joins such a network.
 - Android requires a visible notification for foreground services. It can be hidden by turning off the app's notifications; see [docs/setup.md](docs/setup.md#8-hide-the-notification-optional).
 
 ## Building
@@ -276,8 +337,11 @@ app/                         Android app (Kotlin)
     AndroidNetInfo.kt        Supplies network interfaces to tsnet
     Config.kt                Settings and protocol constants
     EventLog.kt              Persistent event log
-    BootReceiver.kt          Restarts the bridge after a reboot
-tsbridge/                    Go library: userspace Tailscale node and forwarders
+    BootReceiver.kt          Restarts the bridge after a reboot or an update
+    AdbKeeper.kt             Keeps adbd listening on TCP port 5555
+    AdbPairing.kt            One-time pairing with Wireless debugging
+    AdbServices.kt           Finds Wireless debugging services through mDNS
+tsbridge/                    Go library: userspace Tailscale node, forwarders and ADB client
 tools/
   build-aar.sh               Builds the Go library with gomobile
   npm-streams.sh             Creates Nginx Proxy Manager streams for relay setups

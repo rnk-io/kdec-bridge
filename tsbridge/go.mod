@@ -2,10 +2,12 @@ module dev.kdecbridge/tsbridge
 
 go 1.27.1
 
-require tailscale.com v1.102.3
+require (
+	filippo.io/edwards25519 v1.2.0
+	tailscale.com v1.102.3
+)
 
 require (
-	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa // indirect
 	github.com/coder/websocket v1.8.14 // indirect

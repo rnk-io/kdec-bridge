@@ -1,6 +1,8 @@
 package dev.kdecbridge
 
 import android.app.Activity
+import android.app.AlertDialog
+import android.app.NotificationManager
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
@@ -160,6 +162,38 @@ class MainActivity : Activity() {
             setOnClickListener { requestBatteryExemption() }
         })
 
+        root.addView(TextView(this).apply {
+            text = "ADB for scrcpy"
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 36, 0, 4)
+        })
+        root.addView(TextView(this).apply {
+            text = "Turn on TCP ADB: opens ADB on port 5555 and forwards it from the tailnet, " +
+                   "so adb and scrcpy on the computer can connect to this phone's tailnet name, port 5555. " +
+                   "After a restart, or after USB debugging is turned off and on, the bridge turns it " +
+                   "back on the next time the phone is on a Wi-Fi network allowed for Wireless debugging. " +
+                   "The first time, it asks you to allow its ADB key, by pairing with Wireless " +
+                   "debugging or from a computer.\n\n" +
+                   "Turn off TCP ADB: closes port 5555 on every network, turns Wireless debugging off " +
+                   "and stops turning TCP ADB back on. KDE Connect is not affected.\n\n" +
+                   "Requires Developer options with USB debugging on."
+            textSize = 12f
+            setPadding(0, 0, 0, 8)
+        })
+        root.addView(Button(this).apply {
+            text = "Turn on TCP ADB"
+            setOnClickListener { turnOnAdb() }
+        })
+        root.addView(Button(this).apply {
+            text = "Turn off TCP ADB"
+            setOnClickListener {
+                AdbKeeper.turnOff(this@MainActivity)
+                toast("Turning TCP ADB off")
+                ui.postDelayed({ refresh() }, 800)
+            }
+        })
+
         banner = TextView(this).apply {
             setPadding(24, 24, 24, 24)
             textSize = 20f
@@ -299,6 +333,84 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    private fun turnOnAdb() {
+        save()
+        if (Build.VERSION.SDK_INT < 30) {
+            // No Wireless debugging: port 5555 can only be opened from a computer.
+            AdbKeeper.turnOn(this)
+            toast("Android 10 and earlier: run adb tcpip 5555 from a computer after each restart")
+            return
+        }
+        // Allowing the key again also restores the permission, which a
+        // reinstall removes.
+        if (cfg.adbAuthorized && AdbKeeper.canWriteSecureSettings(this)) {
+            AdbKeeper.turnOn(this)
+            toast("Turning TCP ADB on")
+            ui.postDelayed({ refresh() }, 800)
+            return
+        }
+        cfg.adbTcp = true
+        AdbKeeper.applyForward(cfg)
+        // With port 5555 already open, adbd can ask for the key directly.
+        AdbKeeper.probeThen { open ->
+            ui.post {
+                if (open) {
+                    AdbKeeper.authorize(this)
+                    toast("Allow debugging on the prompt, and tick Always allow")
+                } else {
+                    showPairingDialog()
+                }
+            }
+        }
+    }
+
+    /**
+     * Pairing needs the code from Settings, whose pairing dialog closes when
+     * Settings loses focus. The code goes into the notification reply field,
+     * or into this dialog when both apps are open in split screen.
+     */
+    private fun showPairingDialog() {
+        AdbPairing.showPrompt(this)
+        val notificationsOn = getSystemService(NotificationManager::class.java)
+            ?.areNotificationsEnabled() == true
+        val codeField = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = "Six-digit pairing code"
+        }
+        val msg = "Needed once, so that the bridge can open port 5555 by itself. " +
+            "Use one of these methods.\n\n" +
+            "Pair with Wireless debugging:\n" +
+            "1. Connect to Wi-Fi. In Developer options, turn on Wireless debugging. When asked, " +
+            "allow the network and tick \"Always allow on this network\".\n" +
+            "2. Open Settings and KDEC Bridge in split screen. In Settings, tap " +
+            "\"Pair device with pairing code\".\n" +
+            "3. Enter the code below and tap Pair." +
+            (if (notificationsOn) " On phones that keep the pairing dialog open behind the " +
+                "notification shade, the KDEC Bridge notification also takes the code." else "") +
+            "\n\nAllow from a computer:\n" +
+            "Connect the phone by USB and run \"adb tcpip 5555\" on the computer. Then tap " +
+            "Turn on TCP ADB again and allow the debugging prompt, with \"Always allow\" ticked."
+        AlertDialog.Builder(this)
+            .setTitle("Allow KDEC Bridge to use ADB")
+            .setMessage(msg)
+            .setView(LinearLayout(this).apply {
+                setPadding(48, 0, 48, 0)
+                addView(codeField)
+            })
+            .setPositiveButton("Pair") { _, _ ->
+                val code = codeField.text.toString()
+                if (code.isBlank()) return@setPositiveButton
+                toast("Pairing…")
+                AdbPairing.submit(this, code)
+            }
+            .setNeutralButton("Open Developer options") { _, _ ->
+                runCatching { startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)) }
+                    .onFailure { toast("Developer options are not enabled") }
+            }
+            .setNegativeButton("Cancel") { _, _ -> AdbPairing.cancelPrompt(this) }
+            .show()
+    }
+
     private fun requestBatteryExemption() {
         val pm = getSystemService(PowerManager::class.java)
         if (pm.isIgnoringBatteryOptimizations(packageName)) { toast("Already exempt"); return }
@@ -359,7 +471,9 @@ class MainActivity : Activity() {
                 if (!exempt) append("\nBattery optimization is on, which is the likely cause.")
             }
             append("\nbattery   : ").append(if (exempt) "exempt" else "NOT EXEMPT - Doze may stop the service")
+            append("\nadb       : ").append(AdbKeeper.statusLine(cfg))
         }
+        AdbKeeper.probeSoon()
 
         toggle.text = if (running) "Stop bridge" else "Start bridge"
         logView.text = EventLog.recent().joinToString("\n") { "${it.stamp()}  ${it.msg}" }

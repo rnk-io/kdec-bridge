@@ -8,10 +8,16 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.database.ContentObserver
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.provider.Settings
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import tsbridge.Tsbridge
@@ -22,7 +28,8 @@ import tsbridge.Tsbridge
  * Forwards KDE Connect's ports from loopback to the computer and, while KDE
  * Connect is not connected, injects the computer's identity so that KDE
  * Connect connects to the bridge. Direct mode forwards here ([PortProxy]);
- * tsnet mode forwards in Go, and this class only injects.
+ * tsnet mode forwards in Go, and this class only injects. When TCP ADB is
+ * on, it also tells [AdbKeeper] when to turn it back on.
  */
 class BridgeService : Service() {
 
@@ -87,6 +94,9 @@ class BridgeService : Service() {
     @Volatile private var tsnetUp = false
     @Volatile private var alive = false
     private var netCallback: ConnectivityManager.NetworkCallback? = null
+    private var wifiCallback: ConnectivityManager.NetworkCallback? = null
+    private var adbObserver: ContentObserver? = null
+    private val main = Handler(Looper.getMainLooper())
     private val linkLock = Object()
 
     /** Go teardown runs off the main thread. A following start waits for it;
@@ -136,6 +146,11 @@ class BridgeService : Service() {
         cfg.lastHeartbeat = System.currentTimeMillis()
         log("service started (mode=${cfg.mode}, target=$host)")
         registerNetworkCallback()
+        // Before the transport starts, so that tsnet opens the ADB listener
+        // together with the others.
+        AdbKeeper.applyForward(cfg)
+        registerAdbWatchers()
+        AdbKeeper.check(this, "service started")
 
         if (cfg.mode == Config.MODE_TSNET) startTsnet(host) else startDirect(host)
     }
@@ -293,6 +308,7 @@ class BridgeService : Service() {
                 }
                 wasConnected = connected
                 cfg.lastHeartbeat = System.currentTimeMillis()
+                AdbKeeper.periodic(this)
 
                 // Connected: nothing to poll. PortProxy and the tsnet
                 // LinkWatcher call wakeInjector() when the link drops; the
@@ -326,6 +342,30 @@ class BridgeService : Service() {
         runCatching { cm.registerDefaultNetworkCallback(cb) }
     }
 
+    /**
+     * Turns TCP ADB back on when it can: Wireless debugging needs Wi-Fi, and
+     * adbd closes port 5555 when USB debugging is turned off.
+     */
+    private fun registerAdbWatchers() {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val wifi = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = AdbKeeper.check(this@BridgeService, "Wi-Fi connected")
+        }
+        runCatching {
+            cm.registerNetworkCallback(
+                NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), wifi)
+            wifiCallback = wifi
+        }
+        val obs = object : ContentObserver(main) {
+            override fun onChange(selfChange: Boolean) {
+                // adbd takes a moment to start after USB debugging is turned on.
+                main.postDelayed({ AdbKeeper.check(this@BridgeService, "USB debugging changed") }, 3_000)
+            }
+        }
+        contentResolver.registerContentObserver(Settings.Global.getUriFor(Settings.Global.ADB_ENABLED), false, obs)
+        adbObserver = obs
+    }
+
     // ---- teardown -----------------------------------------------------------
 
     private fun stopBridge() {
@@ -339,6 +379,13 @@ class BridgeService : Service() {
             runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) }
         }
         netCallback = null
+        wifiCallback?.let { cb ->
+            runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) }
+        }
+        wifiCallback = null
+        adbObserver?.let { contentResolver.unregisterContentObserver(it) }
+        adbObserver = null
+        main.removeCallbacksAndMessages(null)
         wakeInjector()
         injectThread = null
         proxies.forEach { it.stop() }
