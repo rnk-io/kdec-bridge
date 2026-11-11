@@ -50,7 +50,7 @@ KDEC Bridge removes the conflict. It runs a Tailscale node inside the app, in us
 - **Encrypted in transit.** Over the tailnet, all traffic is carried inside WireGuard. KDE Connect's own TLS session also runs end to end, and the bridge cannot read it.
 - **No root.** Works with the stock KDE Connect app and Android's own ADB daemon.
 - **Low battery use.** Event-driven, with no polling. Nothing keeps the phone awake or wakes it while idle.
-- **Follows the network.** Reports every network change to the tailnet node, so the phone is reachable again within seconds of switching between Wi-Fi and mobile data.
+- **Follows the network.** Reports every network change to the tailnet node, which then looks for its new endpoints at once. Without the report, the node notices a change only at its next 10-minute check.
 - **Recovers on its own.** Restarts after a reboot or an app update, and a watchdog restarts it if Android ends it.
 - **Tells you when it needs you.** A notification appears when only you can fix a problem, such as a tailnet login or an ADB key that has to be allowed again.
 

@@ -6,7 +6,7 @@ A reliability release. It addresses connections that did not come back by themse
 
 ### Fixed
 
-- **The phone stayed unreachable after a network change.** On Android, the tailnet node cannot observe the network and re-reads its interfaces only every 10 minutes. The app now reports every network change to it, including changes underneath a connected VPN app, so the node finds its new endpoints within seconds.
+- **The phone stayed unreachable after a network change.** On Android, the tailnet node cannot observe the network and re-reads its interfaces only every 10 minutes. The app now reports every network change to it, including changes underneath a connected VPN app, and the node looks for its new endpoints at once.
 - **The app's ADB key stopped being trusted.** Android removes an ADB key that has not connected for seven days. The bridge used its key only to open the port after a restart, so the key could be gone by then, and the port stayed closed until the key was allowed again. While TCP ADB is on, the app now turns that timeout off. The new option **Keep ADB authorizations while TCP ADB is on** controls this; it is ticked by default and applies to all ADB authorizations on the phone. The app also checks its key every 12 hours and shows a notification if adbd refuses it.
 - **Repeating lines filled the event log.** A connection attempt that keeps failing the same way is now logged at most every 10 minutes.
 - **A stop from outside the app was recorded as a requested stop.** The bridge was then not restarted after a reboot or when the app was opened. Only **Stop bridge** and the notification's **Stop** action count as requested now.
