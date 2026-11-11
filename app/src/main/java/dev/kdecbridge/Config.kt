@@ -142,6 +142,23 @@ class Config(private val ctx: Context) {
         get() = p.getBoolean("adbAuthorized", false)
         set(v) = p.edit().putBoolean("adbAuthorized", v).apply()
 
+    /** Last time adbd accepted the app's key on port 5555. */
+    var adbKeyCheckedAt: Long
+        get() = p.getLong("adbKeyCheckedAt", 0L)
+        set(v) = p.edit().putLong("adbKeyCheckedAt", v).apply()
+
+    /** While TCP ADB is on, turn off Android's ADB authorization timeout,
+     *  which removes keys that have not connected for seven days. */
+    var adbKeepKeys: Boolean
+        get() = p.getBoolean("adbKeepKeys", true)
+        set(v) = p.edit().putBoolean("adbKeepKeys", v).apply()
+
+    /** The authorization timeout in milliseconds before the app turned it
+     *  off, or -1 if the app has not changed it. */
+    var adbTimeoutSaved: Long
+        get() = p.getLong("adbTimeoutSaved", -1L)
+        set(v) = p.edit().putLong("adbTimeoutSaved", v).apply()
+
     // ---- service state ------------------------------------------------------
 
     var enabled: Boolean

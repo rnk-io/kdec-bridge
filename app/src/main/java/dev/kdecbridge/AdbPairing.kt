@@ -57,6 +57,7 @@ object AdbPairing {
         }
         r.onSuccess {
             Config(ctx).adbAuthorized = true
+            Attention.cancel(ctx, Attention.ADB)
             BridgeService.log("adb: paired with Wireless debugging")
             notify(ctx, "Paired", "KDEC Bridge can now turn TCP ADB on by itself.",
                 input = false, autoCancel = true)

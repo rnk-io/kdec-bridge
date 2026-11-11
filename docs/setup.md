@@ -52,7 +52,7 @@ KDEC Bridge is not on any app store. Download the APK (`kdec-bridge-v*.apk`) fro
 Alternatively, install it over USB with USB debugging enabled:
 
 ```bash
-adb install -r kdec-bridge-v0.3.apk
+adb install -r kdec-bridge-v0.4.apk
 ```
 
 The release page lists the file's SHA-256 checksum, which you can compare with `sha256sum` to confirm the download is intact. To build the APK yourself, see [building.md](building.md).
@@ -93,13 +93,13 @@ Tap **Exempt from battery optimization** and allow the exemption. Without it, Do
 
 Once the exemption is granted, the status shows `battery : exempt`.
 
-### 6. Hide the notification (optional)
+### 6. Hide the status notification (optional)
 
-Android requires a foreground service to show a notification and does not let apps make it silent. To hide it, turn off the app's notifications:
+Android requires a foreground service to show a notification and does not let apps make it silent. To hide it, turn off its category and leave the others on:
 
-**Settings → Apps → KDEC Bridge → Notifications → Off**
+**Settings → Apps → KDEC Bridge → Notifications → Bridge status → Off**
 
-The service keeps running without a status bar icon. Android restarts the app's process when this permission changes, so open the app once afterwards. The app asks for notification permission only once, so the setting is kept.
+The service keeps running without a status bar icon. Keep the **Action needed** category on: the app uses it to tell you when something needs your attention, such as an ADB key that has to be allowed again. Turning off all of the app's notifications hides those as well.
 
 ## KDE Connect
 
@@ -136,6 +136,8 @@ The bridge keeps the phone's ADB daemon listening on TCP port 5555 and forwards 
 3. Connect to Wi-Fi. In **Developer options → Wireless debugging**, turn Wireless debugging on. When Android asks, tick **Always allow on this network** and allow it.
 
 The bridge can open the ADB port by itself only on Wi-Fi networks allowed this way, so repeat step 3 on each network where that should happen. Wireless debugging can be turned off again afterwards; the bridge turns it on for a moment when it needs it.
+
+Android removes a debugging authorization that has not been used for seven days. While TCP ADB is on, the app turns that timeout off, for its own key and for your computer's, so you do not have to change **Disable adb authorization timeout** in Developer options yourself. To keep Android's timeout, untick **Keep ADB authorizations while TCP ADB is on** in the app. The bridge then cannot open the port by itself once its key has been removed, and asks you to allow the key again.
 
 ### 10. Allow the app's ADB key
 
@@ -182,7 +184,7 @@ If the connection goes through a Tailscale relay, lower the bit rate and size, f
 
 ### Turning TCP ADB off
 
-Tap **Turn off TCP ADB**. Port 5555 closes on every network, Wireless debugging is turned off, and the bridge stops opening the port. **Turn on TCP ADB** opens it again without another key prompt, once the phone is on an allowed Wi-Fi network.
+Tap **Turn off TCP ADB**. Port 5555 closes on every network, Wireless debugging is turned off, the ADB authorization timeout is put back, and the bridge stops opening the port. **Turn on TCP ADB** opens it again without another key prompt, once the phone is on an allowed Wi-Fi network.
 
 Turning off USB debugging also closes port 5555. When USB debugging is turned on again, the bridge opens the port the next time the phone is on an allowed Wi-Fi network.
 
@@ -208,7 +210,9 @@ adb shell run-as dev.kdecbridge cat files/events.log
 |---|---|
 | `LOGIN NEEDED` does not clear | The node has not been approved. Tap **Authenticate tailnet**, or check the Tailscale admin console |
 | Works, then stops overnight | The battery optimization exemption has not been granted |
-| Banner shows `■ KILLED BY SYSTEM` | Android or a task killer stopped the service. The event log records when it was last running |
+| Banner shows `■ KILLED BY SYSTEM` | Android or a task killer stopped the service. The event log records when it was last running. The watchdog restarts the bridge within about 15 minutes of the phone being awake, if the battery optimization exemption has been granted |
+| Unreachable for a while after changing networks | Update to version 0.4 or later, which reports network changes to the tailnet node |
+| The bridge starts again after being stopped from Android's settings | Only **Stop bridge** in the app, or **Stop** on the notification, stops it for good |
 
 ### KDE Connect
 
@@ -224,12 +228,15 @@ adb shell run-as dev.kdecbridge cat files/events.log
 |---|---|
 | `adb : key not allowed yet` | Tap **Turn on TCP ADB** and allow the app's key, as in step 10 |
 | `adb : … allowed once only …` | **Always allow** was not ticked on the prompt. Tap **Turn on TCP ADB** again and tick it |
-| `adb : … no longer allowed …` | The phone's debugging authorizations were revoked. Tap **Turn on TCP ADB** and allow the key again |
+| `adb : … no longer allowed …` | The phone's debugging authorizations were revoked, or Android removed the key after seven days without a connection: on a version before 0.4, or with **Keep ADB authorizations** unticked. Tap **Turn on TCP ADB** and allow the key again. If port 5555 is closed, open it first with `adb tcpip 5555` over USB, or pair again |
 | `adb : waiting for Wi-Fi` | Port 5555 is closed, and opening it needs Wi-Fi. Connect to a Wi-Fi network allowed for Wireless debugging |
-| `adb : Wireless debugging is not allowed on this Wi-Fi network …` | Turn on Wireless debugging once on this network, as in step 9. Or tap **Turn on TCP ADB** with the screen unlocked and allow the network |
+| `adb : Wireless debugging is not allowed on this Wi-Fi network …` | Turn on Wireless debugging once on this network, as in step 9. Or tap **Turn on TCP ADB**, or the notification, with the screen unlocked and allow the network |
+| `adb : could not turn on: …` | An attempt failed. The bridge repeats it by itself, after 15 seconds at first |
+| `adb connect` reports `unauthorized` after a week without use | Android removed the computer's authorization. Unlock the phone and allow it, and leave **Keep ADB authorizations while TCP ADB is on** ticked |
+| The log fills with `dial … failed` or `connection refused` lines | Update to version 0.4 or later, which writes a repeating line only every 10 minutes |
 | `adb : USB debugging is off` | Turn on USB debugging in Developer options |
 | `pairing service not found` | Settings closed the pairing dialog before the code was entered. Pair in split screen |
-| `adb connect` times out | TCP ADB is off, or the bridge is not running. Check the `adb` line in the status |
+| `adb connect` times out or fails after about 10 seconds | TCP ADB is off, the bridge is not running, or the port was closed and could not be opened in time. Try once more, then check the `adb` line in the status |
 | `adb connect` reports `unauthorized` | Unlock the phone and allow debugging from the computer |
 
 ## Adding or replacing a computer

@@ -13,6 +13,7 @@ tsnet runs WireGuard and a userspace TCP/IP stack in-process. It needs no TUN de
 | `SetNetInfo(NetInfo)` | Supplies the network interface list from Java. Call before `Start` |
 | `Start(...)` | Brings up the node and all listeners. Blocks until the node is authenticated, so call it off the UI thread |
 | `Stop()` | Closes everything and aborts a pending login. Safe to call when nothing is running |
+| `NetworkChanged(ifName)` | Reports a network change, with the default network's interface name. Call on every change; see below |
 | `Status()`, `LoginURL()` | Cached node state and pending login URL. Never block |
 
 **KDE Connect**
@@ -32,6 +33,8 @@ tsnet runs WireGuard and a userspace TCP/IP stack in-process. It needs no TUN de
 | `AdbPair(keyDir, host, port, code)` | Pairs the app's ADB key with a Wireless debugging pairing service |
 | `AdbAuthorize(keyDir, host, port, timeoutSec)` | Connects to adbd's classic TCP port and, if the key is not trusted, has adbd show the "Allow USB debugging?" prompt for it |
 | `AdbExec(keyDir, host, port, service, timeoutSec)` | Connects to adbd with the app's key, runs one service such as `tcpip:5555` or `usb:`, and returns its output |
+| `AdbCheck(keyDir, host, port, timeoutSec)` | Authenticates to adbd with the app's key and closes the connection. Fails if the key is not trusted, which lets the app notice a removed key before it is needed |
+| `SetAdbWaker(AdbWaker)` | Registers a callback for tailnet connections that arrive while adbd is not listening. If the callback reports that the port is being opened, the connection is held for up to 9 seconds |
 
 ## Building
 
@@ -63,13 +66,14 @@ Holding the low payload ports on loopback moves KDE Connect's own payload server
 These issues do not occur on desktop platforms.
 
 1. **Interface enumeration.** `net.Interfaces()` reads the netlink RIB, which Android's SELinux policy denies to apps (`netlinkrib: permission denied`). The app enumerates interfaces with `java.net.NetworkInterface` and passes them as JSON through `SetNetInfo`, which registers them with `netmon.RegisterInterfaceGetter`. Tailscale's Android client takes the same approach.
-2. **Log state directory.** `logpolicy` panics with `no safe place found to store log state` when none of its candidate directories is writable, which is the case on Android. `Start` sets `TS_LOGS_DIR` to the app's state directory.
-3. **Panics across JNI.** A Go panic that reaches the JNI boundary aborts the whole process with `SIGABRT`. `Start` recovers panics and returns them as errors.
-4. **Blocking calls.** `Up()` blocks until the node is authenticated, which never happens while it waits for a login. `Status()` returns a cached value and `LoginURL()` exposes the pending login URL, so the UI never blocks.
-5. **Stopping during login.** `Start` does not hold its lock while waiting in `Up()`, and `Stop` cancels that wait, so a pending login can always be aborted.
-6. **Asynchronous UDP writes.** netstack sends UDP datagrams asynchronously, and closing a socket immediately after `Write` can discard the datagram. Identity discovery keeps its UDP socket open for the whole attempt.
-7. **16 KB page alignment.** gomobile produces 4 KB-aligned libraries by default. The build links with `-z max-page-size=16384`, which 16 KB-page devices require from Android 15 onwards.
+2. **Network changes.** The network monitor cannot subscribe to netlink either, so on Android it polls the interface list every 10 minutes and relies on the app to report changes. The app calls `NetworkChanged` from its `ConnectivityManager` callbacks. It passes the interface name to `netmon.UpdateLastKnownDefaultRouteInterface` and injects an event into the monitor.
+3. **Log state directory.** `logpolicy` panics with `no safe place found to store log state` when none of its candidate directories is writable, which is the case on Android. `Start` sets `TS_LOGS_DIR` to the app's state directory.
+4. **Panics across JNI.** A Go panic that reaches the JNI boundary aborts the whole process with `SIGABRT`. Exported functions recover panics and return them as errors, and callbacks into the app are guarded the same way.
+5. **Blocking calls.** `Up()` blocks until the node is authenticated, which never happens while it waits for a login. `Status()` returns a cached value and `LoginURL()` exposes the pending login URL, so the UI never blocks.
+6. **Stopping during login.** `Start` does not hold its lock while waiting in `Up()`, and `Stop` cancels that wait, so a pending login can always be aborted.
+7. **Asynchronous UDP writes.** netstack sends UDP datagrams asynchronously, and closing a socket immediately after `Write` can discard the datagram. Identity discovery keeps its UDP socket open for the whole attempt.
+8. **16 KB page alignment.** gomobile produces 4 KB-aligned libraries by default. The build links with `-z max-page-size=16384`, which 16 KB-page devices require from Android 15 onwards.
 
 ## Logging
 
-tsnet's internal logging is discarded, and upload of diagnostic logs to Tailscale is disabled with `logtail.Disable()`. Status messages intended for the user go to the app's event log through the `Logger` interface.
+tsnet's internal logging is discarded, and upload of diagnostic logs to Tailscale is disabled with `logtail.Disable()`. Status messages intended for the user go to the app's event log through the `Logger` interface. A failed connection attempt that repeats with the same message is logged at most every 10 minutes.

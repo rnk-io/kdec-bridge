@@ -39,9 +39,10 @@ type NetInfo interface{ Interfaces() string }
 // Callbacks have their own lock: they are invoked from goroutines that outlive
 // Start and Stop, and atomic.Value cannot hold a nil interface.
 var (
-	cbMu    sync.RWMutex
-	logger  Logger
-	watcher LinkWatcher
+	cbMu     sync.RWMutex
+	logger   Logger
+	watcher  LinkWatcher
+	adbWaker AdbWaker
 )
 
 var (
@@ -65,6 +66,45 @@ func logf(format string, a ...any) {
 	if l != nil {
 		l.Log(fmt.Sprintf(format, a...))
 	}
+}
+
+// logfLimited logs a message that can repeat many times a minute, such as a
+// failed connection attempt that the other side keeps retrying. A message
+// equal to the last one logged under the same key is dropped for
+// repeatLogInterval, so that it does not push everything else out of the
+// app's event log.
+func logfLimited(key, format string, a ...any) {
+	msg := fmt.Sprintf(format, a...)
+	now := time.Now()
+	repeatMu.Lock()
+	last, seen := repeatLast[key]
+	if seen && last.msg == msg && now.Sub(last.at) < repeatLogInterval {
+		repeatMu.Unlock()
+		return
+	}
+	repeatLast[key] = repeatEntry{msg, now}
+	repeatMu.Unlock()
+	logf("%s", msg)
+}
+
+const repeatLogInterval = 10 * time.Minute
+
+type repeatEntry struct {
+	msg string
+	at  time.Time
+}
+
+var (
+	repeatMu   sync.Mutex
+	repeatLast = map[string]repeatEntry{}
+)
+
+// resetRepeat forgets the last message under key, so that the next one is
+// logged even if it is the same.
+func resetRepeat(key string) {
+	repeatMu.Lock()
+	delete(repeatLast, key)
+	repeatMu.Unlock()
 }
 
 func setStatus(s string) { statusCache.Store(s) }
@@ -218,6 +258,30 @@ func Start(stateDir, authKey, hostname, target string,
 	return nil
 }
 
+// NetworkChanged tells the node that the phone's network changed. ifName is
+// the interface of the default network, or "" if there is none.
+//
+// Android does not let the node observe the network itself, and on Android it
+// re-checks its interfaces only every ten minutes. Without this call, the node
+// can stay unreachable for that long after the phone changes networks.
+func NetworkChanged(ifName string) {
+	defer func() { recover() }()
+	netmon.UpdateLastKnownDefaultRouteInterface(ifName)
+	mu.Lock()
+	s := srv
+	mu.Unlock()
+	if s == nil {
+		return
+	}
+	sys := s.Sys()
+	if sys == nil {
+		return
+	}
+	if nm, ok := sys.NetMon.GetOK(); ok {
+		nm.InjectEvent()
+	}
+}
+
 // ControlPort reports the loopback port the control channel actually bound.
 // 0 while not running.
 func ControlPort() int { return int(controlPort.Load()) }
@@ -256,10 +320,11 @@ func forwardOne(s *tsnet.Server, localPort int, target string, remotePort int, i
 				cancel()
 				if err != nil {
 					// Only established connections count as a live link.
-					logf("dial %s failed: %v", dst, err)
+					logfLimited("dial:"+dst, "dial %s failed: %v", dst, err)
 					c.Close()
 					return
 				}
+				resetRepeat("dial:" + dst)
 				if isControl {
 					if ctrlAlive.Add(1) == 1 {
 						notifyLink(true)
@@ -498,6 +563,7 @@ func Stop() {
 	cbMu.Lock()
 	logger = nil
 	watcher = nil
+	adbWaker = nil
 	cbMu.Unlock()
 }
 

@@ -37,6 +37,7 @@ KDEC Bridge removes the conflict. It runs a Tailscale node inside the app, in us
 - [Limitations](#limitations)
 - [Building](#building)
 - [Project structure](#project-structure)
+- [Changelog](#changelog)
 - [Support](#support)
 - [License](#license)
 
@@ -48,8 +49,10 @@ KDEC Bridge removes the conflict. It runs a Tailscale node inside the app, in us
 - **No open ports.** Connects through Tailscale with NAT traversal. No port forwarding or relay server is required.
 - **Encrypted in transit.** Over the tailnet, all traffic is carried inside WireGuard. KDE Connect's own TLS session also runs end to end, and the bridge cannot read it.
 - **No root.** Works with the stock KDE Connect app and Android's own ADB daemon.
-- **Low battery use.** Event-driven, with no polling, wakelocks or alarms.
-- **Recovers on its own.** Restarts after a reboot or an app update, and records when Android stops the service.
+- **Low battery use.** Event-driven, with no polling. Nothing keeps the phone awake or wakes it while idle.
+- **Follows the network.** Reports every network change to the tailnet node, so the phone is reachable again within seconds of switching between Wi-Fi and mobile data.
+- **Recovers on its own.** Restarts after a reboot or an app update, and a watchdog restarts it if Android ends it.
+- **Tells you when it needs you.** A notification appears when only you can fix a problem, such as a tailnet login or an ADB key that has to be allowed again.
 
 ### KDE Connect
 
@@ -60,7 +63,9 @@ KDEC Bridge removes the conflict. It runs a Tailscale node inside the app, in us
 ### ADB for scrcpy
 
 - **Reach the phone from anywhere.** `adb connect` and scrcpy work over the tailnet, by the phone's tailnet name.
-- **Stays on.** Opens the ADB port again after a restart, when Wi-Fi connects, or when USB debugging is turned back on.
+- **Stays on.** Opens the ADB port again after a restart, when Wi-Fi connects, or when USB debugging is turned back on. Failed attempts are repeated.
+- **Opens on demand.** If `adb` or scrcpy connects while the port is closed, the bridge opens it and the connection goes through.
+- **Keeps its key.** Android drops ADB keys that go unused for seven days. While TCP ADB is on, the bridge turns that timeout off, so its key is still trusted after the next restart. This can be switched off in the app.
 - **One-time setup.** Allow the app's ADB key with one tap on the phone's "Allow USB debugging?" prompt, or pair it with Wireless debugging.
 - **Simple to switch off.** **Turn off TCP ADB** closes the port on every network; **Turn on TCP ADB** opens it again.
 
@@ -115,11 +120,13 @@ Only an ADB client can switch adbd to TCP mode, so the bridge acts as one. Once 
 - **From a computer.** Connect the phone by USB, run `adb tcpip 5555`, then tap **Turn on TCP ADB** and allow the "Allow USB debugging?" prompt with **Always allow** ticked.
 - **By pairing with Wireless debugging.** No computer is needed. Open Settings and KDEC Bridge in split screen, tap **Pair device with pairing code** in Settings, and enter the code in the app.
 
-**Keeping the port open.** While TCP ADB is on, the bridge checks port 5555 when the service starts (including after a reboot or an app update), when the phone joins a Wi-Fi network, when USB debugging is turned on, and every 10 minutes. If the port is closed, the bridge opens it again through Wireless debugging. This needs:
+**Keeping the port open.** While TCP ADB is on, the bridge checks port 5555 when the service starts (including after a reboot or an app update), when the phone joins a Wi-Fi network, when the phone is unlocked, when USB debugging is turned on, when `adb` or scrcpy connects from the tailnet, and every 10 minutes. If the port is closed, the bridge opens it again through Wireless debugging, and repeats a failed attempt after 15 seconds to 5 minutes. A connection that arrives while the port is closed is held for up to 9 seconds, which is usually enough for it to succeed. Opening the port needs:
 
 - **Wi-Fi.** Android allows Wireless debugging only on Wi-Fi. Once port 5555 is open, it stays open on mobile data and on other networks.
 - **A Wi-Fi network allowed for Wireless debugging.** Android asks once per network; tick **Always allow on this network**. On a network that is not allowed, Android refuses while the screen is locked and asks while it is unlocked.
 - **USB debugging on.** Turning USB debugging off closes port 5555. The bridge never turns USB debugging on.
+
+**Keeping the key trusted.** Android removes an ADB key that has not connected for seven days. The bridge needs its key only after a restart, which can be weeks apart, so the key would usually be gone by then. While TCP ADB is on, the app therefore turns that timeout off, which is the setting behind **Disable adb authorization timeout** in Developer options. It applies to every authorization on the phone, including your computer's. The option **Keep ADB authorizations while TCP ADB is on** controls this and is ticked by default; unticking it, or turning TCP ADB off, puts the previous setting back. The app also checks its key on port 5555 every 12 hours. If adbd ever refuses the key, the app shows a notification; allowing it again takes one tap while the port is still open.
 
 **Turn off TCP ADB** closes port 5555 on every network, turns Wireless debugging off and stops the bridge from opening the port again.
 
@@ -210,6 +217,10 @@ All settings are on the app's main screen, in the order listed.
 | Turn on TCP ADB | Opens ADB on port 5555, forwards it from the tailnet and keeps it open. The first time, asks you to allow the app's ADB key |
 | Turn off TCP ADB | Closes port 5555 on every network, turns Wireless debugging off and stops the bridge from opening the port again. KDE Connect is not affected |
 
+| Option | Description | Default |
+|---|---|---|
+| Keep ADB authorizations while TCP ADB is on | Turns off Android's ADB authorization timeout, which removes keys that have not connected for seven days. Applies to all authorizations on the phone. The previous setting is put back when this is unticked or TCP ADB is turned off | Checked |
+
 ## Status and diagnostics
 
 ### Status banner
@@ -230,14 +241,14 @@ stateDiagram-v2
     }
     Running --> Stopped: Stop
     Running --> Killed: Ended by Android
-    Killed --> Running: App reopened or phone restarted
+    Killed --> Running: Watchdog, app reopened or phone restarted
 ```
 
 | Banner | Meaning |
 |---|---|
 | `● CONNECTED` | KDE Connect has a live link through the bridge |
 | `○ CONNECTING…` | The service is running without a link: starting up, the computer is offline, or tailnet login is pending |
-| `■ KILLED BY SYSTEM` | The service stopped without a request, usually because of Doze, memory pressure or a task killer |
+| `■ KILLED BY SYSTEM` | The service stopped without a request, usually because of Doze, memory pressure or a task killer. The watchdog restarts it within about 15 minutes of the phone being awake |
 | `○ STOPPED` | Stopped from the app |
 
 ### Status details
@@ -253,8 +264,20 @@ stateDiagram-v2
 | `last beat` | Last heartbeat. After an unexpected stop, this is when the service was last running |
 | `battery` | `exempt`, or a warning that Doze may stop the service |
 | `adb` | `off`, `on - :5555 open, forwarded from the tailnet`, or why port 5555 is closed, for example `waiting for Wi-Fi` |
+| `adb keys` | Whether Android keeps ADB authorizations, or after how many days without a connection it removes them |
 
 The screen refreshes every second while it is open.
+
+### Notifications
+
+Besides the status notification, the app has an **Action needed** category for problems that only you can fix. Tapping the notification opens the app.
+
+| Notification | Meaning |
+|---|---|
+| TCP ADB needs your approval | adbd no longer trusts the app's ADB key. Tapping starts **Turn on TCP ADB**, which asks you to allow the key again |
+| Allow Wireless debugging on this Wi-Fi | Port 5555 is closed, and Android has not been told to allow Wireless debugging on this network. Tapping retries; tick **Always allow on this network** |
+| Tailscale sign-in needed | The tailnet node has to be signed in, at first start or after its key expired. Tap **Authenticate tailnet** |
+| KDEC Bridge stopped | Android ended the bridge and did not let the watchdog restart it. Opening the app restarts it |
 
 ### Event log
 
@@ -274,9 +297,9 @@ adb logcat -s KdecBridge
 | `reverse tailnet :1744-1764 -> loopback` | Tailnet listeners for transfers started by the phone are ready |
 | `linked :1717 -> <target>` | KDE Connect connected through the bridge |
 | `LINK UP` / `LINK DOWN` | Link state changed. Reported as it happens, without polling |
-| `dial … failed: connection refused` | The computer is reachable, but `kdeconnectd` is not running |
+| `dial … failed: connection refused` | The computer is reachable, but `kdeconnectd` is not running. While an attempt keeps failing the same way, the line is repeated only every 10 minutes |
 | `dial … failed: no such host` | MagicDNS does not resolve yet. Expected for a few seconds after start-up |
-| `network changed - re-checking link` | The phone switched networks; the link is checked immediately |
+| `network changed - re-checking link` | The phone switched networks. The tailnet node is told, and the link is checked immediately |
 | `app swiped out of recents` | The app was swiped away. The service keeps running |
 | `SERVICE DESTROYED while running` | The service was stopped without a request |
 | `identity: learned from <name>` | Discovery succeeded and the identity was stored for this address |
@@ -284,7 +307,9 @@ adb logcat -s KdecBridge
 | `identity: discovery failed … will retry` | Discovery is retried while no identity is stored and KDE Connect is disconnected |
 | `port N busy, control channel on :M` | The preferred port was taken; KDE Connect is given the port in use |
 | `!! previous session ended unexpectedly - last alive HH:MM:SS` | Written at the next launch after the service was killed. Check for this line first if the bridge keeps stopping |
-| `restarting bridge after unexpected death` | The bridge was restarted automatically |
+| `restarting bridge after unexpected death` | The bridge was restarted when the app was opened |
+| `watchdog: bridge is not running - last alive HH:MM:SS, restarting` | The watchdog found the bridge stopped and restarted it |
+| `watchdog: Android refused the restart - …` | Android did not allow a restart from the background. Grant the battery optimization exemption |
 
 **ADB for scrcpy**
 
@@ -294,11 +319,17 @@ adb logcat -s KdecBridge
 | `adb: tailnet connection -> 127.0.0.1:5555` | `adb` or scrcpy on the computer connected |
 | `adb: key allowed on the phone` | The app's key was allowed through the "Allow USB debugging?" prompt |
 | `adb: paired with Wireless debugging` | The app's key was paired with Wireless debugging |
-| `adb: granted WRITE_SECURE_SETTINGS` | The app can now switch Wireless debugging on and off |
-| `adb: turning TCP ADB on (…)` | Port 5555 was closed and the bridge is opening it, with the reason, for example `Wi-Fi connected` |
+| `adb: granted WRITE_SECURE_SETTINGS` | The app can now switch Wireless debugging on and off, and set the ADB authorization timeout |
+| `adb: turning TCP ADB on (…)` | Port 5555 was closed and the bridge is opening it, with the reason, for example `Wi-Fi connected`, `phone unlocked` or `incoming connection` |
+| `adb: tailnet connection while adbd is closed - waiting for the port to open` | `adb` or scrcpy connected while port 5555 was closed. The connection is held while the bridge opens the port |
+| `adb: could not turn on: …` and `adb: trying again in Ns` | An attempt failed and is repeated |
+| `adb: the app's key is no longer allowed …` | adbd refused the app's key. Tap **Turn on TCP ADB** and allow it again |
+| `adb: authorization timeout turned off …` | The app turned off Android's ADB authorization timeout, because **Keep ADB authorizations** is ticked |
+| `adb: authorization timeout restored` | The app put the previous timeout back |
+| `adb: connection refused - adbd is not listening …` | `adb` or scrcpy connected from the tailnet while port 5555 was closed and could not be opened. Repeated only every 10 minutes |
 | `adb: TCP ADB on, :5555 open` | adbd is listening on port 5555 |
 | `adb: waiting for Wi-Fi` | Port 5555 is closed, and opening it needs Wi-Fi |
-| `adb: Wireless debugging is not allowed on this Wi-Fi network …` | Android refused Wireless debugging on this network. Allow it once in Developer options |
+| `adb: Wireless debugging is not allowed on this Wi-Fi network …` | Android refused Wireless debugging on this network. If the screen was locked, the bridge asks again when the phone is unlocked. Otherwise allow it once in Developer options |
 | `adb: TCP ADB off, :5555 closed` | TCP ADB was turned off in the app |
 
 ## Transports
@@ -345,11 +376,18 @@ Measured over 2 hours 47 minutes of service uptime:
 | Wi-Fi sleep time | 99.9% |
 | Radio active time (Rx + Tx) | 6.9 s |
 
-The app uses no wakelocks or alarms, so it neither keeps the phone awake nor wakes it from Doze. Most network activity is Tailscale's own keepalive traffic.
+The figures were measured with KDE Connect linked and port 5555 open, which is the normal state. The app does not keep the phone awake and never wakes it from Doze. Most network activity is Tailscale's own keepalive traffic.
+
+Two things run outside that steady state:
+
+- **A wakelock while opening the ADB port.** Opening the port takes several seconds, and the phone could otherwise suspend halfway. The wakelock is held only for that attempt and is released after 2 minutes at most. The port is opened after a restart, not during normal use.
+- **A watchdog alarm.** It checks about every 15 minutes that the bridge is still running. The alarm does not wake the phone; it is delivered the next time the phone is awake.
 
 The bridge does not poll while connected. Its injection loop sleeps until a link opens or closes, the network changes, or a 120-second safety timeout expires; the timeout also serves as the heartbeat. While disconnected, it retries at the reconnect interval. Intervals below 2 seconds have no benefit, because KDE Connect accepts at most one connection per second from an address.
 
-TCP ADB adds no background work of its own. Its checks run when the network or the USB debugging setting changes, and otherwise at most every 10 minutes, as a single loopback connection while the port is open.
+TCP ADB adds almost no background work. Its checks run when the network or the USB debugging setting changes and when the phone is unlocked, and otherwise at most every 10 minutes, as a single loopback connection while the port is open. Every 12 hours that connection also authenticates with the app's key.
+
+A computer whose `adb` is still connected to the phone retries several times a second when it cannot reach port 5555. If the bridge cannot open the port, it starts a new attempt for such connections after 1 minute at first and at most every 30 minutes. Run `adb disconnect` on the computer when you no longer need the connection.
 
 ## Privacy and security
 
@@ -359,7 +397,8 @@ TCP ADB adds no background work of its own. Its checks run when the network or t
 - **Backups.** App data is excluded from Android cloud backups and device-to-device transfers, so node keys, learned identities and the ADB key stay on the phone.
 - **Exposure.** In tsnet mode, the bridge listens on no public interface. Loopback listeners accept connections only from the phone itself, and tailnet listeners only from the tailnet.
 - **TCP ADB.** While TCP ADB is on, adbd accepts connections on port 5555 on every network the phone is connected to, not only through the tailnet. Each computer still has to be allowed on the phone. Classic ADB over TCP is authenticated but not encrypted; through the tailnet, WireGuard encrypts it. If the tailnet is shared, restrict port 5555 on the phone to your computer with a Tailscale access rule. Tap **Turn off TCP ADB** when it is not needed.
-- **ADB key.** The app creates its own ADB key on the phone and keeps it in private storage. It uses the key only to connect to adbd on the phone itself. The `WRITE_SECURE_SETTINGS` permission is granted to the app over ADB once its key is trusted, and is used only to switch Wireless debugging on and off.
+- **ADB key.** The app creates its own ADB key on the phone and keeps it in private storage. It uses the key only to connect to adbd on the phone itself: to open and close port 5555, and every 12 hours to check that the key is still trusted. The `WRITE_SECURE_SETTINGS` permission is granted to the app over ADB once its key is trusted. It is used only to switch Wireless debugging on and off and to set the ADB authorization timeout.
+- **ADB authorization timeout.** While TCP ADB is on and **Keep ADB authorizations** is ticked, the app turns off Android's timeout that removes authorizations after seven days without a connection. Authorizations for computers you no longer use then stay until you revoke them in Developer options. Untick the option to keep Android's timeout; the bridge then cannot open the port by itself once its key has been removed.
 
 ## Limitations
 
@@ -392,6 +431,8 @@ app/                         Android app (Kotlin)
     EventLog.kt              Persistent event log
     BootReceiver.kt          Restarts the bridge after a reboot or an update
     AndroidNetInfo.kt        Supplies network interfaces to tsnet
+    Watchdog.kt              Restarts the bridge if Android ends it
+    Attention.kt             Notifications for problems only the user can fix
 
     Injector.kt              KDE Connect: sends identity packets over loopback
     IdentityDiscovery.kt     KDE Connect: learns the computer's identity
@@ -407,6 +448,10 @@ tools/
   npm-streams.sh             Creates Nginx Proxy Manager streams for relay setups
 docs/                        Setup, architecture and build documentation
 ```
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 
 ## Support
 

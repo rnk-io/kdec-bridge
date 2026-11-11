@@ -9,9 +9,12 @@ This document describes how KDEC Bridge carries KDE Connect and ADB between an A
   - [Computer identity](#computer-identity)
   - [File transfer](#file-transfer)
   - [Link monitoring](#link-monitoring)
+  - [Network changes](#network-changes)
 - [ADB for scrcpy](#adb-for-scrcpy)
   - [Opening port 5555](#opening-port-5555)
   - [When the bridge checks](#when-the-bridge-checks)
+  - [Connections that find the port closed](#connections-that-find-the-port-closed)
+  - [Keeping the key trusted](#keeping-the-key-trusted)
   - [Closing port 5555](#closing-port-5555)
   - [Trusting the app's key](#trusting-the-apps-key)
   - [Pairing](#pairing)
@@ -47,10 +50,12 @@ socket = SocketFactory.getDefault().createSocket(address, tcpPort);
 | `tsbridge` | Go (gomobile) | Both | tsnet node, loopback and tailnet listeners, identity discovery over the tailnet, and the ADB client |
 | `MainActivity` | Kotlin | Both | Settings, controls, status and event log |
 | `EventLog` | Kotlin | Both | Timestamped log file that survives the process being killed |
+| `Watchdog` | Kotlin | Both | Repeating alarm that restarts the bridge if Android ended it |
+| `Attention` | Kotlin | Both | Notifications for problems that only the user can fix |
 | `Injector` | Kotlin | KDE Connect | Sends identity packets to KDE Connect's UDP port on loopback |
 | `IdentityDiscovery` | Kotlin | KDE Connect | Learns the computer's identity. Runs in Kotlin in direct mode and calls into Go in tsnet mode |
 | `PortProxy`, `DirectTcpTransport` | Kotlin | KDE Connect | Loopback TCP forwarding in direct mode |
-| `AdbKeeper` | Kotlin | ADB | Keeps adbd listening on TCP port 5555: opens and closes it, and decides when to open it again |
+| `AdbKeeper` | Kotlin | ADB | Keeps adbd listening on TCP port 5555: opens and closes it, decides when to open it again, and keeps the app's key trusted by turning off Android's authorization timeout |
 | `AdbPairing` | Kotlin | ADB | Pairing with Wireless debugging, with the code entered in the app or in a notification |
 | `AdbServices` | Kotlin | ADB | Finds this phone's Wireless debugging services through mDNS |
 
@@ -171,6 +176,14 @@ Link changes are reported by `PortProxy` in direct mode and by the Go `LinkWatch
 
 A `ConnectivityManager` network callback wakes the loop when the phone changes networks.
 
+### Network changes
+
+Tailscale's network monitor normally learns about network changes from the kernel. Android does not give apps that access, so on Android the monitor only re-reads the interface list every 10 minutes and expects the app to report changes. Until it knows about a change, the node keeps advertising endpoints that no longer exist, and peers cannot reach it directly.
+
+`BridgeService` registers two `ConnectivityManager` callbacks: one for the default network, and one for every network with internet access. The second is needed while a VPN app is connected, because the VPN stays the default network while Wi-Fi and mobile data change underneath it. Callbacks arrive in bursts, so the service waits 500 ms for them to settle and then calls `NetworkChanged` in the Go library with the default network's interface name. The library passes the name to the monitor and injects a change event, and the node re-binds its sockets and finds its endpoints again.
+
+A network appearing or disappearing is always reported. A change of link properties is reported only if an interface or address changed, since link properties also change for unrelated reasons such as new DNS servers.
+
 ## ADB for scrcpy
 
 ADB connects from the computer to the phone. The bridge accepts each connection on the tailnet, forwards it to adbd on loopback, and keeps adbd in TCP mode so that there is a port to forward to.
@@ -223,11 +236,36 @@ sequenceDiagram
 |---|---|
 | Service start, including after a reboot or an app update | `BridgeService.startBridge` |
 | The phone joins a Wi-Fi network | `ConnectivityManager` callback for Wi-Fi networks |
+| The phone is unlocked | `ACTION_USER_PRESENT`; also retries a network that was refused while locked |
 | USB debugging is turned on or off | `ContentObserver` on `adb_enabled`, 3 seconds after the change |
+| `adb` or scrcpy connects from the tailnet while the port is closed | Tailnet listener, through the `AdbWaker` callback |
+| A previous attempt failed | Retry after 15, 30, 60, 120 and 300 seconds |
 | At most every 10 minutes | Injection loop |
-| **Turn on TCP ADB** | Button; also retries a network that was refused |
+| **Turn on TCP ADB** | Button or notification; also retries a network that was refused |
 
 Every check first connects to `127.0.0.1:5555` and stops there if adbd accepts. Checks run one at a time on a single worker thread. The bridge never turns USB debugging on; while it is off, the check reports `USB debugging is off` and waits for the setting to change.
+
+**Wakelock.** Opening the port takes several seconds: Wireless debugging starts, its port is found through mDNS, and adbd restarts. Most triggers arrive with the screen off, when the phone would otherwise suspend again before the attempt finishes. The attempt therefore holds a partial wakelock, released when it ends and after 2 minutes at most. Checks that find the port open, or that cannot proceed, take no wakelock.
+
+**Retries.** An attempt that fails for a reason that may pass, such as the Wireless debugging port not being found, is repeated with increasing delays. After the fifth retry, the next attempt waits for one of the other triggers. Conditions that need a change on the phone are not retried on a timer: no Wi-Fi, USB debugging off, a network that is not allowed, or a key that adbd refuses.
+
+**Networks that are not allowed.** If Android refuses Wireless debugging on a network while the screen is locked, it does not ask the user. The bridge tries once more at the next unlock, when Android can show its dialog. If the network is refused with the screen unlocked, the bridge shows a notification instead and does not ask again on that connection.
+
+### Connections that find the port closed
+
+When a tailnet connection arrives and adbd does not accept on loopback, the listener calls back into the app, which starts a check. If the port can be opened, meaning the key is trusted, USB debugging is on and the phone is on a Wi-Fi network that has not been refused, the listener holds the connection and retries the loopback connection every 300 ms for up to 9 seconds. `adb` waits about 10 seconds for the handshake, so the connection that found the port closed usually succeeds. If the port cannot be opened, the connection is closed at once.
+
+An `adb` server that has lost a device it was connected to retries several times a second for as long as it runs. After a connection from the tailnet has led to a failed attempt, further connections therefore start no new attempt for 1 minute, doubling to at most 30 minutes, and are closed at once. Other triggers are not affected. The log line for a refused connection is written at most every 10 minutes.
+
+### Keeping the key trusted
+
+Android records when each trusted ADB key last connected and removes keys that have not connected for the time in the global setting `adb_allowed_connection_time`, seven days by default. The bridge uses its key only to open or close the port, which may not happen for weeks, so the key would be gone by the time a restart made it necessary.
+
+Connecting with the key at intervals does not prevent this reliably. adbd queues its report of an authenticated connection for the system and sends it only together with a later event, such as a prompt. On the tested phone, no report had been sent minutes after connections on port 5555.
+
+While TCP ADB is on and **Keep ADB authorizations** is ticked, `AdbKeeper` therefore sets `adb_allowed_connection_time` to 0, which keeps authorizations indefinitely. This is what **Disable adb authorization timeout** in Developer options does, and it needs the `WRITE_SECURE_SETTINGS` permission the app already holds. The setting applies to all ADB keys on the phone. The app stores the previous value and writes it back when the option is unticked or TCP ADB is turned off, unless the setting has been changed elsewhere in the meantime.
+
+Independently of the timeout, the periodic check authenticates to port 5555 with the app's key every 12 hours and closes the connection. If adbd refuses the key, for example after the phone's debugging authorizations were revoked, the app clears its record of being trusted and shows a notification. At that point the port is still open, so allowing the key again takes one tap on the "Allow USB debugging?" prompt.
 
 ### Closing port 5555
 
@@ -293,13 +331,16 @@ stateDiagram-v2
 ```
 
 - The service is a foreground service with the `specialUse` type.
-- On start, it sets `enabled` and clears `cleanStop`. A stop from the app or the notification sets `cleanStop`.
+- On start, it sets `enabled` and clears `cleanStop`. A stop from the app or the notification sets `cleanStop` and clears `enabled`. A stop from anywhere else changes neither, so the bridge still counts as meant to run.
 - Every pass of the injection loop records a heartbeat, at least every 120 seconds.
 - When the app starts and finds the bridge enabled but not running, and `cleanStop` is not set, the service was killed. The app writes one log entry dated from the last heartbeat and restarts the bridge.
 - `BootReceiver` restarts the bridge after a reboot or an app update if it was enabled.
-- While it runs, the service registers a callback for Wi-Fi networks and an observer on the USB debugging setting, so that `AdbKeeper` can open port 5555 again when possible. See [When the bridge checks](#when-the-bridge-checks).
+- `Watchdog` sets an inexact repeating alarm of 15 minutes while the bridge is meant to run. Its receiver restarts the bridge under the same condition. The alarm uses elapsed time without wake-up, so it is delivered only while the phone is awake. Android allows a service start from the background only for apps exempt from battery optimization; if the start is refused, the app shows a notification.
+- The service registers network callbacks and reports changes to the tailnet node. See [Network changes](#network-changes).
+- While it runs, the service registers a callback for Wi-Fi networks, a receiver for unlocks and an observer on the USB debugging setting, so that `AdbKeeper` can open port 5555 again when possible. See [When the bridge checks](#when-the-bridge-checks).
 - If tsnet fails to start, for example at boot before the network is available, the start is retried with exponential backoff from 5 to 60 seconds.
 - Stopping tsnet closes sockets and can abort a pending login, so it runs off the main thread; a following start waits for it to finish.
+- When the node asks for a login, at first start or after its key has expired, the app shows a notification.
 
 ## Network exposure
 

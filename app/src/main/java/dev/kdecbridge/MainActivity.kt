@@ -36,6 +36,7 @@ class MainActivity : Activity() {
     private lateinit var intervalField: EditText
     private lateinit var payloadOffsetField: EditText
     private lateinit var payloadBox: CheckBox
+    private lateinit var keepKeysBox: CheckBox
     private lateinit var toggle: Button
     private lateinit var banner: TextView
     private lateinit var status: TextView
@@ -181,6 +182,24 @@ class MainActivity : Activity() {
             textSize = 12f
             setPadding(0, 0, 0, 8)
         })
+        keepKeysBox = CheckBox(this).apply {
+            text = "Keep ADB authorizations while TCP ADB is on"
+            isChecked = cfg.adbKeepKeys
+            setOnCheckedChangeListener { _, checked ->
+                cfg.adbKeepKeys = checked
+                AdbKeeper.keyTimeoutChanged(this@MainActivity)
+            }
+        }
+        root.addView(keepKeysBox)
+        root.addView(TextView(this).apply {
+            text = "Android removes a debugging authorization that has not been used for 7 days. " +
+                   "That includes this app's own key, which it needs to open port 5555 after a restart, " +
+                   "and your computer's. While this is ticked and TCP ADB is on, the app turns that " +
+                   "timeout off for all authorizations (Developer options: \"Disable adb authorization " +
+                   "timeout\"). Turning TCP ADB off, or unticking this, puts the previous setting back."
+            textSize = 12f
+            setPadding(0, 0, 0, 8)
+        })
         root.addView(Button(this).apply {
             text = "Turn on TCP ADB"
             setOnClickListener { turnOnAdb() }
@@ -242,25 +261,37 @@ class MainActivity : Activity() {
             if (cfg.host.isNotBlank()) BridgeService.start(this)
             ui.postDelayed({ refresh() }, 800)
         }
+        handleAttention(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleAttention(intent)
+    }
+
+    /** Carries out the action of a tapped [Attention] notification, once. */
+    private fun handleAttention(intent: Intent?) {
+        val action = intent?.getStringExtra(Attention.EXTRA_ACTION) ?: return
+        intent.removeExtra(Attention.EXTRA_ACTION)
+        if (action == Attention.ACTION_ADB_ON) turnOnAdb()
     }
 
     /**
-     * Records an unexpected stop in the event log once, then restarts the
-     * bridge. The banner only shows the current state, so without this entry
-     * a kill would go unnoticed once the bridge was running again.
+     * Restarts the bridge if it should be running but is not, and records
+     * the unexpected stop in the event log once. The banner only shows the
+     * current state, so without this entry a kill would go unnoticed once
+     * the bridge was running again.
      */
     private fun noteUnexpectedDeath() {
+        if (!Watchdog.bridgeIsDown(cfg)) return
         val beat = cfg.lastHeartbeat
-        if (!BridgeService.isRunning && cfg.enabled && !cfg.cleanStop &&
-            beat > 0 && beat != cfg.killReported) {
+        if (beat > 0 && beat != cfg.killReported) {
             cfg.killReported = beat
             EventLog.add("!! previous session ended unexpectedly - last alive " +
                 EventLog.clockOf(beat) + " (" + EventLog.ago(beat) + ")")
-            if (cfg.host.isNotBlank()) {
-                EventLog.add("restarting bridge after unexpected death")
-                BridgeService.start(this)
-            }
         }
+        EventLog.add("restarting bridge after unexpected death")
+        BridgeService.start(this)
     }
 
     private fun label(text: String) = TextView(this).apply {
@@ -472,6 +503,7 @@ class MainActivity : Activity() {
             }
             append("\nbattery   : ").append(if (exempt) "exempt" else "NOT EXEMPT - Doze may stop the service")
             append("\nadb       : ").append(AdbKeeper.statusLine(cfg))
+            AdbKeeper.keyTimeoutLine(this@MainActivity)?.let { append("\nadb keys  : ").append(it) }
         }
         AdbKeeper.probeSoon()
 

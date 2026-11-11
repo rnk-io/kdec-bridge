@@ -9,8 +9,11 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-    <!-- Granted by the app itself over ADB after pairing; used only to switch
-         Wireless debugging on and off. -->
+    <!-- Held for up to two minutes while the ADB port is being opened. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Granted by the app itself over ADB once its key is trusted; used only
+         to switch Wireless debugging on and off and to set the ADB
+         authorization timeout. -->
     <uses-permission
         android:name="android.permission.WRITE_SECURE_SETTINGS"
         tools:ignore="ProtectedPermissions" />
@@ -25,6 +28,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTop"
             android:label="KDEC Bridge">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -43,6 +47,10 @@
 
         <receiver
             android:name=".PairingCodeReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".WatchdogReceiver"
             android:exported="false" />
 
         <receiver

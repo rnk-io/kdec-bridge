@@ -48,6 +48,18 @@ var (
 	adbLnPort int          // guarded by mu
 )
 
+// AdbWaker is called when a tailnet connection arrives while adbd is not
+// listening. OnAdbClosed starts opening the port and reports whether it is
+// likely to open within a few seconds.
+type AdbWaker interface{ OnAdbClosed() bool }
+
+// SetAdbWaker registers the callback. Stop clears it.
+func SetAdbWaker(w AdbWaker) {
+	cbMu.Lock()
+	adbWaker = w
+	cbMu.Unlock()
+}
+
 // SetAdbForward opens a tailnet listener on port that forwards connections to
 // adbd on loopback, or closes it when port is 0. It can be called at any time:
 // before Start, the listener opens once the node is up.
@@ -81,18 +93,59 @@ func openAdbLocked(s *tsnet.Server, port int) error {
 				return
 			}
 			go func() {
-				d, err := net.DialTimeout("tcp", local, 5*time.Second)
+				d, err := dialAdbd(local)
 				if err != nil {
-					logf("adb: connection refused - adbd is not listening on %s", local)
+					// adb retries a device it cannot reach several times a second.
+					logfLimited("adb-refused", "adb: connection refused - adbd is not listening on %s", local)
 					c.Close()
 					return
 				}
+				resetRepeat("adb-refused")
 				logf("adb: tailnet connection -> %s", local)
 				splice(c, d)
 			}()
 		}
 	}()
 	return nil
+}
+
+// adbWakeWait is how long a tailnet connection is held while the app opens
+// adbd's port. adb gives up on a connection after about ten seconds.
+const adbWakeWait = 9 * time.Second
+
+// dialAdbd connects to adbd on loopback. If adbd is not listening, it asks
+// the app to open the port and, if the app can, keeps trying until the port
+// opens, so that the connection that found it closed still succeeds.
+func dialAdbd(local string) (net.Conn, error) {
+	d, err := net.DialTimeout("tcp", local, 2*time.Second)
+	if err == nil {
+		return d, nil
+	}
+	cbMu.RLock()
+	w := adbWaker
+	cbMu.RUnlock()
+	if w == nil || !wakeAdb(w) {
+		return nil, err
+	}
+	logf("adb: tailnet connection while adbd is closed - waiting for the port to open")
+	deadline := time.Now().Add(adbWakeWait)
+	for time.Now().Before(deadline) {
+		time.Sleep(300 * time.Millisecond)
+		if d, err = net.DialTimeout("tcp", local, time.Second); err == nil {
+			return d, nil
+		}
+	}
+	return nil, err
+}
+
+// wakeAdb calls the app's callback. A panic there must not cross JNI.
+func wakeAdb(w AdbWaker) (opening bool) {
+	defer func() {
+		if recover() != nil {
+			opening = false
+		}
+	}()
+	return w.OnAdbClosed()
 }
 
 func closeAdbLocked() {
@@ -529,6 +582,23 @@ func AdbExec(keyDir, host string, port int, service string, timeoutSec int) (out
 	}
 	defer a.c.Close()
 	return a.run(service)
+}
+
+// AdbCheck opens an authenticated connection to adbd at host:port with the
+// app's key and closes it. It fails if adbd no longer trusts the key, which
+// lets the app notice a removed key before it is needed.
+func AdbCheck(keyDir, host string, port int, timeoutSec int) (err error) {
+	defer recoverTo(&err)
+	k, err := loadKey(keyDir)
+	if err != nil {
+		return err
+	}
+	a, err := adbConnect(host, port, k, time.Duration(timeoutSec)*time.Second, false)
+	if err != nil {
+		return err
+	}
+	a.c.Close()
+	return nil
 }
 
 // AdbAuthorize connects to adbd's classic TCP port at host:port. If the app's

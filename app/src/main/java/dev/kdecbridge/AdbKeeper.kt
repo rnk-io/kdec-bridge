@@ -1,6 +1,7 @@
 package dev.kdecbridge
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.KeyguardManager
 import android.content.Context
 import android.content.pm.PackageManager
@@ -8,11 +9,16 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
+import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import java.io.File
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import tsbridge.Tsbridge
 
 /**
@@ -27,6 +33,12 @@ import tsbridge.Tsbridge
  * allows Wireless debugging only on Wi-Fi, so turning TCP ADB back on after a
  * restart waits for Wi-Fi. Once on, port 5555 stays open on every network
  * until the phone restarts or USB debugging is turned off.
+ *
+ * Android removes an ADB key that has not connected for seven days, and the
+ * app's key is needed only after a restart, which can be weeks apart. While
+ * TCP ADB is on, the app therefore turns that timeout off, unless the user
+ * has unticked the option. It also checks its key on port 5555 at intervals,
+ * to notice a removed key while allowing it again is still one tap.
  */
 object AdbKeeper {
 
@@ -35,7 +47,50 @@ object AdbKeeper {
     /** Minimum interval between checks that no event asked for. */
     private const val RECHECK_MS = 10 * 60_000L
 
-    private val worker = Executors.newSingleThreadExecutor { Thread(it, "adb") }
+    /** Delays before a failed attempt is repeated. After the last one, the
+     *  next attempt waits for an event or the periodic check. */
+    private val RETRY_MS = longArrayOf(15_000, 30_000, 60_000, 120_000, 300_000)
+
+    /** How often the app's key is checked on port 5555. */
+    private const val KEY_CHECK_MS = 12 * 3_600_000L
+
+    /** Settings.Global.ADB_ALLOWED_CONNECTION_TIME: how long an ADB key stays
+     *  trusted without connecting, in milliseconds. 0 means indefinitely. It
+     *  is the setting behind "Disable adb authorization timeout" in
+     *  Developer options. */
+    private const val ADB_ALLOWED_CONNECTION_TIME = "adb_allowed_connection_time"
+    private const val DEFAULT_ALLOWED_CONNECTION_TIME = 7 * 24 * 3_600_000L
+
+    /** After a connection from the tailnet led to a failed attempt, further
+     *  connections start no new attempt for this long, doubling up to the
+     *  maximum. adb retries an unreachable device several times a second. */
+    private const val WAKE_COOLDOWN_MS = 60_000L
+    private const val WAKE_COOLDOWN_MAX_MS = 30 * 60_000L
+
+    /** Upper bound for the wakelock held while port 5555 is being opened. */
+    private const val WAKELOCK_MS = 120_000L
+
+    private const val KEY_NOT_ALLOWED = "key not allowed yet - tap Turn on TCP ADB"
+    private const val KEY_LOST = "the app's key is no longer allowed - tap Turn on TCP ADB to allow it again"
+
+    private val worker = Executors.newSingleThreadScheduledExecutor { Thread(it, "adb") }
+
+    private enum class Outcome { DONE, WAITING, FAILED }
+
+    /** The application context, which lives as long as the process. */
+    @SuppressLint("StaticFieldLeak")
+    @Volatile private var appCtx: Context? = null
+
+    // Used on the worker thread only.
+    private var failures = 0
+    private var pendingRetry: ScheduledFuture<*>? = null
+
+    private val wakePending = AtomicBoolean(false)
+    @Volatile private var wakeBlockedUntil = 0L
+    @Volatile private var wakeFailures = 0
+
+    /** Set when adbd refused a key it had trusted before. */
+    @Volatile private var keyLost = false
 
     /** Whether adbd accepted a connection on port 5555 at the last check. */
     @Volatile var listening = false
@@ -55,7 +110,16 @@ object AdbKeeper {
      *  attempts skip it, so that the confirmation dialog is not shown again. */
     @Volatile private var refusedOn: Network? = null
 
+    /** Whether that refusal happened with the screen locked. Android does not
+     *  ask the user then, so one more attempt is made after the next unlock. */
+    @Volatile private var refusedLocked = false
+
     fun keyDir(ctx: Context): String = File(ctx.filesDir, "adb").absolutePath
+
+    /** Called when the service starts; [wake] needs a context. */
+    fun attach(ctx: Context) {
+        appCtx = ctx.applicationContext
+    }
 
     /** Opens or closes the tailnet listener to match the settings. */
     fun applyForward(cfg: Config) {
@@ -71,6 +135,9 @@ object AdbKeeper {
         val cfg = Config(app)
         cfg.adbTcp = true
         refusedOn = null
+        refusedLocked = false
+        wakeBlockedUntil = 0L
+        wakeFailures = 0
         applyForward(cfg)
         BridgeService.log("adb: TCP ADB turned on in the app")
         worker.execute { arm(app, "turned on in the app", manual = true) }
@@ -106,7 +173,11 @@ object AdbKeeper {
                     return@execute report("the key was allowed once only - tap Turn on TCP ADB again " +
                         "and tick Always allow")
                 }
-                Config(app).adbAuthorized = true
+                Config(app).apply {
+                    adbAuthorized = true
+                    adbKeyCheckedAt = System.currentTimeMillis()
+                }
+                keyLost = false
                 detail = ""
                 BridgeService.log("adb: key allowed on the phone")
                 if (!canWriteSecureSettings(app)) grantWriteSecureSettings(app)
@@ -131,6 +202,65 @@ object AdbKeeper {
     fun check(ctx: Context, why: String) {
         val app = ctx.applicationContext
         worker.execute { arm(app, why, manual = false) }
+    }
+
+    /**
+     * Called when adb or scrcpy connects from the tailnet and port 5555 is
+     * closed. Starts a check and reports whether the port is likely to open
+     * within a few seconds, in which case the connection is kept waiting.
+     */
+    fun wake(): Boolean = runCatching {
+        val ctx = appCtx ?: return false
+        val cfg = Config(ctx)
+        if (!cfg.adbTcp) return false
+        if (SystemClock.elapsedRealtime() < wakeBlockedUntil) return false
+        if (wakePending.compareAndSet(false, true)) {
+            worker.execute {
+                try {
+                    arm(ctx, "incoming connection", manual = false)
+                    if (listening) {
+                        wakeFailures = 0
+                    } else {
+                        val wait = (WAKE_COOLDOWN_MS shl wakeFailures.coerceAtMost(5))
+                            .coerceAtMost(WAKE_COOLDOWN_MAX_MS)
+                        wakeFailures++
+                        wakeBlockedUntil = SystemClock.elapsedRealtime() + wait
+                    }
+                } finally {
+                    wakePending.set(false)
+                }
+            }
+        }
+        Build.VERSION.SDK_INT >= 30 && cfg.adbAuthorized && debuggingEnabled(ctx) &&
+            canWriteSecureSettings(ctx) && wifiNetwork(ctx).let { it != null && it != refusedOn }
+    }.getOrDefault(false)
+
+    /** Called when the phone is unlocked. Android asks the user about an
+     *  unknown Wi-Fi network only while unlocked, so a refusal that happened
+     *  with the screen locked is tried once more. */
+    fun onUnlock(ctx: Context) {
+        val app = ctx.applicationContext
+        if (!Config(app).adbTcp) return
+        worker.execute {
+            if (refusedLocked) {
+                refusedLocked = false
+                refusedOn = null
+            }
+            arm(app, "phone unlocked", manual = false)
+        }
+    }
+
+    /** Called when the "keep authorizations" option changes. */
+    fun keyTimeoutChanged(ctx: Context) {
+        val app = ctx.applicationContext
+        worker.execute { applyKeyTimeout(app, Config(app)) }
+    }
+
+    /** One line for the status panel, or null if the setting cannot be read. */
+    fun keyTimeoutLine(ctx: Context): String? = when (val t = allowedConnectionTime(ctx)) {
+        null -> null
+        0L -> "kept - Android's authorization timeout is off"
+        else -> "removed after ${t / (24 * 3_600_000L)} days without a connection"
     }
 
     /** Called on every injector pass; checks at most every [RECHECK_MS]. */
@@ -173,6 +303,7 @@ object AdbKeeper {
         !cfg.adbTcp && listening -> "off in the app, but port ${Config.ADB_PORT} is open"
         !cfg.adbTcp -> "off"
         busy && detail.isNotBlank() -> detail
+        listening && !cfg.adbAuthorized && detail.isNotBlank() -> "on - :${Config.ADB_PORT} open; $detail"
         listening && cfg.mode == Config.MODE_TSNET -> "on - :${Config.ADB_PORT} open, forwarded from the tailnet"
         listening -> "on - :${Config.ADB_PORT} open (tailnet forwarding needs tsnet mode)"
         busy -> detail.ifBlank { "working…" }
@@ -181,32 +312,59 @@ object AdbKeeper {
 
     // ---- worker -------------------------------------------------------------
 
-    private fun arm(ctx: Context, why: String, manual: Boolean) {
+    private fun arm(ctx: Context, why: String, manual: Boolean, retry: Boolean = false) {
         busy = true
-        try { armOnce(ctx, why, manual) } finally { busy = false }
+        try {
+            pendingRetry?.cancel(false)
+            pendingRetry = null
+            if (!retry) failures = 0
+            if (armOnce(ctx, why, manual) == Outcome.FAILED && failures < RETRY_MS.size) {
+                val delay = RETRY_MS[failures++]
+                BridgeService.log("adb: trying again in ${delay / 1000}s")
+                pendingRetry = worker.schedule(
+                    { arm(ctx, "retry", manual = false, retry = true) }, delay, TimeUnit.MILLISECONDS)
+            }
+        } finally {
+            busy = false
+        }
     }
 
-    private fun armOnce(ctx: Context, why: String, manual: Boolean) {
+    private fun armOnce(ctx: Context, why: String, manual: Boolean): Outcome {
         lastCheck = System.currentTimeMillis()
         val cfg = Config(ctx)
         listening = probe()
-        if (!cfg.adbTcp || listening) {
+        applyKeyTimeout(ctx, cfg)
+        if (!cfg.adbTcp) {
             detail = ""
-            return
+            Attention.cancel(ctx, Attention.ADB)
+            return Outcome.DONE
         }
-        if (!debuggingEnabled(ctx)) return report("USB debugging is off")
+        if (listening) {
+            if (keepKey(ctx, cfg, force = false)) {
+                detail = ""
+                Attention.cancel(ctx, Attention.ADB)
+            }
+            return Outcome.DONE
+        }
+        if (!debuggingEnabled(ctx)) return waiting("USB debugging is off")
         if (Build.VERSION.SDK_INT < 30) {
-            return report("closed - run adb tcpip 5555 from a computer (Android 10 and earlier)")
+            return waiting("closed - run adb tcpip 5555 from a computer (Android 10 and earlier)")
         }
-        if (!cfg.adbAuthorized) return report("key not allowed yet - tap Turn on TCP ADB")
+        if (!cfg.adbAuthorized) return waiting(if (keyLost) KEY_LOST else KEY_NOT_ALLOWED)
         if (!canWriteSecureSettings(ctx)) {
-            return report("cannot switch Wireless debugging - tap Turn on TCP ADB to allow the key again")
+            return waiting("cannot switch Wireless debugging - tap Turn on TCP ADB to allow the key again")
         }
-        val wifi = wifiNetwork(ctx) ?: return report("waiting for Wi-Fi")
+        val wifi = wifiNetwork(ctx) ?: return waiting("waiting for Wi-Fi")
         if (!manual && wifi == refusedOn) {
-            return report("Wireless debugging is not allowed on this Wi-Fi network")
+            return waiting("Wireless debugging is not allowed on this Wi-Fi network")
         }
+        // Opening the port takes several seconds. Without a wakelock the
+        // phone can suspend halfway when the attempt starts with the screen
+        // off, for example when Wi-Fi connects.
+        return awake(ctx) { open(ctx, cfg, wifi, why) }
+    }
 
+    private fun open(ctx: Context, cfg: Config, wifi: Network, why: String): Outcome {
         BridgeService.log("adb: turning TCP ADB on ($why)")
         detail = "turning on…"
         val r = runCatching {
@@ -217,26 +375,128 @@ object AdbKeeper {
             }
         }
         r.exceptionOrNull()?.let { e ->
-            when {
+            return when {
                 e is RefusedException -> {
                     refusedOn = wifi
-                    report("Wireless debugging is not allowed on this Wi-Fi network - " +
-                        "allow it once in Developer options")
+                    refusedLocked = ctx.getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
+                    if (refusedLocked) {
+                        waiting("Wireless debugging is not allowed on this Wi-Fi network - " +
+                            "will ask when the phone is unlocked")
+                    } else {
+                        Attention.show(ctx, Attention.ADB, "Allow Wireless debugging on this Wi-Fi",
+                            "TCP ADB is closed. Tap, then tick \"Always allow on this network\" and allow.",
+                            Attention.ACTION_ADB_ON)
+                        waiting("Wireless debugging is not allowed on this Wi-Fi network - " +
+                            "allow it once in Developer options")
+                    }
                 }
                 isKeyRejected(e) -> {
-                    cfg.adbAuthorized = false
-                    report("the app's key is no longer allowed - tap Turn on TCP ADB to allow it again")
+                    keyRejected(ctx, cfg)
+                    Outcome.WAITING
                 }
-                else -> report("could not turn on: ${e.message}")
+                else -> {
+                    report("could not turn on: ${e.message}")
+                    Outcome.FAILED
+                }
             }
-            return
         }
         listening = waitFor(true)
-        if (listening) {
-            detail = ""
-            BridgeService.log("adb: TCP ADB on, :${Config.ADB_PORT} open")
-        } else {
+        if (!listening) {
             report("adbd did not open :${Config.ADB_PORT}")
+            return Outcome.FAILED
+        }
+        detail = ""
+        BridgeService.log("adb: TCP ADB on, :${Config.ADB_PORT} open")
+        if (keepKey(ctx, cfg, force = true)) Attention.cancel(ctx, Attention.ADB)
+        return Outcome.DONE
+    }
+
+    /** The ADB authorization timeout in milliseconds, or null if Android
+     *  does not let the app read it. */
+    private fun allowedConnectionTime(ctx: Context): Long? = runCatching {
+        Settings.Global.getLong(ctx.contentResolver, ADB_ALLOWED_CONNECTION_TIME, DEFAULT_ALLOWED_CONNECTION_TIME)
+    }.getOrNull()
+
+    /**
+     * Turns Android's ADB authorization timeout off while TCP ADB is on and
+     * the option is ticked, and puts the previous value back otherwise. A
+     * value the user changed in the meantime is left alone.
+     */
+    private fun applyKeyTimeout(ctx: Context, cfg: Config) {
+        if (!canWriteSecureSettings(ctx)) return
+        val cr = ctx.contentResolver
+        val current = allowedConnectionTime(ctx)
+        if (cfg.adbTcp && cfg.adbKeepKeys) {
+            if (current == 0L) return
+            // Unreadable, and already turned off by an earlier pass.
+            if (current == null && cfg.adbTimeoutSaved >= 0) return
+            runCatching { Settings.Global.putLong(cr, ADB_ALLOWED_CONNECTION_TIME, 0L) }
+                .onSuccess {
+                    cfg.adbTimeoutSaved = current ?: DEFAULT_ALLOWED_CONNECTION_TIME
+                    BridgeService.log("adb: authorization timeout turned off, so that ADB keys stay trusted")
+                }
+                .onFailure { BridgeService.log("adb: could not turn off the authorization timeout - ${it.message}") }
+        } else if (cfg.adbTimeoutSaved >= 0) {
+            val saved = cfg.adbTimeoutSaved
+            cfg.adbTimeoutSaved = -1
+            if (current != null && current != 0L) return
+            runCatching { Settings.Global.putLong(cr, ADB_ALLOWED_CONNECTION_TIME, saved) }
+                .onSuccess { BridgeService.log("adb: authorization timeout restored") }
+        }
+    }
+
+    /**
+     * Checks the app's key on port 5555 if it has not been checked for
+     * [KEY_CHECK_MS]. Returns false if the key is not trusted.
+     */
+    private fun keepKey(ctx: Context, cfg: Config, force: Boolean): Boolean {
+        if (!cfg.adbAuthorized) {
+            report(if (keyLost) KEY_LOST else KEY_NOT_ALLOWED)
+            return false
+        }
+        val now = System.currentTimeMillis()
+        if (!force && now - cfg.adbKeyCheckedAt in 0 until KEY_CHECK_MS) return true
+        val e = runCatching {
+            Tsbridge.adbCheck(keyDir(ctx), "127.0.0.1", Config.ADB_PORT.toLong(), 10)
+        }.exceptionOrNull()
+        when {
+            e == null -> {
+                cfg.adbKeyCheckedAt = now
+                keyLost = false
+            }
+            isKeyRejected(e) -> {
+                keyRejected(ctx, cfg)
+                return false
+            }
+            // Anything else is not a verdict on the key; the next check tries again.
+        }
+        return true
+    }
+
+    private fun keyRejected(ctx: Context, cfg: Config) {
+        cfg.adbAuthorized = false
+        keyLost = true
+        report(KEY_LOST)
+        Attention.show(ctx, Attention.ADB, "TCP ADB needs your approval",
+            "Android no longer trusts the app's ADB key. Tap to allow it again.",
+            Attention.ACTION_ADB_ON)
+    }
+
+    private fun waiting(msg: String): Outcome {
+        report(msg)
+        return Outcome.WAITING
+    }
+
+    private fun <T> awake(ctx: Context, block: () -> T): T {
+        val lock = runCatching {
+            ctx.getSystemService(PowerManager::class.java)
+                ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "kdecbridge:adb")
+        }.getOrNull()
+        runCatching { lock?.acquire(WAKELOCK_MS) }
+        try {
+            return block()
+        } finally {
+            runCatching { if (lock?.isHeld == true) lock.release() }
         }
     }
 
@@ -246,6 +506,9 @@ object AdbKeeper {
     }
 
     private fun disarmOnce(ctx: Context) {
+        pendingRetry?.cancel(false)
+        pendingRetry = null
+        Attention.cancel(ctx, Attention.ADB)
         detail = ""
         var error: String? = null
         if (probe()) {
@@ -266,6 +529,7 @@ object AdbKeeper {
         if (canWriteSecureSettings(ctx)) {
             runCatching { Settings.Global.putInt(ctx.contentResolver, ADB_WIFI_ENABLED, 0) }
         }
+        applyKeyTimeout(ctx, Config(ctx))
         listening = waitFor(false)
         if (listening) {
             report("could not close :${Config.ADB_PORT}" + (error?.let { " ($it)" } ?: "") +

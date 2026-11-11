@@ -5,11 +5,14 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.database.ContentObserver
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -28,8 +31,9 @@ import tsbridge.Tsbridge
  * Forwards KDE Connect's ports from loopback to the computer and, while KDE
  * Connect is not connected, injects the computer's identity so that KDE
  * Connect connects to the bridge. Direct mode forwards here ([PortProxy]);
- * tsnet mode forwards in Go, and this class only injects. When TCP ADB is
- * on, it also tells [AdbKeeper] when to turn it back on.
+ * tsnet mode forwards in Go, and this class only injects. It reports network
+ * changes to the tailnet node, which cannot observe them on Android. When
+ * TCP ADB is on, it also tells [AdbKeeper] when to turn it back on.
  */
 class BridgeService : Service() {
 
@@ -46,6 +50,9 @@ class BridgeService : Service() {
 
         /** Minimum interval between identity discovery attempts. */
         private const val DISCOVERY_RETRY_MS = 60_000L
+
+        /** Network callbacks arrive in bursts; one report covers a burst. */
+        private const val NET_SETTLE_MS = 500L
 
         @Volatile var isRunning = false
             private set
@@ -93,9 +100,10 @@ class BridgeService : Service() {
     @Volatile private var lastDiscovery = 0L
     @Volatile private var tsnetUp = false
     @Volatile private var alive = false
-    private var netCallback: ConnectivityManager.NetworkCallback? = null
+    private val netCallbacks = mutableListOf<ConnectivityManager.NetworkCallback>()
     private var wifiCallback: ConnectivityManager.NetworkCallback? = null
     private var adbObserver: ContentObserver? = null
+    private var unlockReceiver: BroadcastReceiver? = null
     private val main = Handler(Looper.getMainLooper())
     private val linkLock = Object()
 
@@ -118,7 +126,8 @@ class BridgeService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            if (::cfg.isInitialized) stopBridge()
+            if (!::cfg.isInitialized) cfg = Config(this)
+            stopBridge(requested = true)
             stopSelf()
             return START_NOT_STICKY
         }
@@ -145,7 +154,10 @@ class BridgeService : Service() {
         cfg.startedAt = System.currentTimeMillis()
         cfg.lastHeartbeat = System.currentTimeMillis()
         log("service started (mode=${cfg.mode}, target=$host)")
+        Watchdog.schedule(this)
+        Attention.cancel(this, Attention.BRIDGE)
         registerNetworkCallback()
+        AdbKeeper.attach(this)
         // Before the transport starts, so that tsnet opens the ADB listener
         // together with the others.
         AdbKeeper.applyForward(cfg)
@@ -205,17 +217,32 @@ class BridgeService : Service() {
                     Tsbridge.setLinkWatcher(object : tsbridge.LinkWatcher {
                         override fun onLink(up: Boolean) = wakeInjector()
                     })
+                    Tsbridge.setAdbWaker(object : tsbridge.AdbWaker {
+                        override fun onAdbClosed(): Boolean = AdbKeeper.wake()
+                    })
+                    Tsbridge.networkChanged(defaultInterface())
                     Tsbridge.start(
                         stateDir, cfg.authKey, cfg.nodeName, target,
                         cfg.bridgePort.toLong(), cfg.remotePort.toLong(),
                         Config.PAYLOAD_MIN.toLong(), Config.FWD_LAST.toLong(),
                         Config.REV_FIRST.toLong(), Config.PAYLOAD_MAX.toLong(),
                         object : tsbridge.Logger {
-                            override fun log(msg: String) = Companion.log(msg)
+                            override fun log(msg: String) {
+                                Companion.log(msg)
+                                // The node asks for a login at first start, and
+                                // again if its key expires while it runs.
+                                if (alive && "https://login.tailscale.com/" in msg) {
+                                    Attention.show(this@BridgeService, Attention.BRIDGE,
+                                        "Tailscale sign-in needed",
+                                        "The bridge is offline until its tailnet node is signed in. " +
+                                            "Tap, then tap Authenticate tailnet.")
+                                }
+                            }
                         }
                     )
                     if (!alive) { runCatching { Tsbridge.stop() }; return@Thread }
                     tsnetUp = true
+                    Attention.cancel(this, Attention.BRIDGE)
                     activePort = Tsbridge.controlPort().toInt()
                     if (cfg.authKey.isNotBlank()) {
                         // The node state on disk now holds the identity; the
@@ -330,17 +357,68 @@ class BridgeService : Service() {
         synchronized(linkLock) { linkLock.notifyAll() }
     }
 
+    /**
+     * Watches the default network and every network that carries traffic.
+     * With a VPN app connected, the default network stays the same while
+     * Wi-Fi and mobile data change underneath it, so both are needed.
+     */
     private fun registerNetworkCallback() {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                log("network changed - re-checking link")
-                wakeInjector()
-            }
+        fun callback() = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = onNetworkEvent(always = true)
+            override fun onLost(network: Network) = onNetworkEvent(always = true)
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) = onNetworkEvent(always = false)
         }
-        netCallback = cb
-        runCatching { cm.registerDefaultNetworkCallback(cb) }
+        runCatching {
+            val cb = callback()
+            cm.registerDefaultNetworkCallback(cb)
+            netCallbacks += cb
+        }
+        runCatching {
+            val cb = callback()
+            cm.registerNetworkCallback(
+                NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).build(), cb)
+            netCallbacks += cb
+        }
     }
+
+    private val networkSettled = Runnable {
+        if (!alive) return@Runnable
+        val ifName = defaultInterface()
+        // Link properties also change for reasons that do not matter here,
+        // such as new DNS servers. Those are reported only if an interface
+        // or address changed.
+        val state = ifName + AndroidNetInfo.interfaces()
+        val always = netEventAlways
+        netEventAlways = false
+        if (!always && state == lastNetState) return@Runnable
+        lastNetState = state
+        log("network changed - re-checking link")
+        if (cfg.mode == Config.MODE_TSNET) {
+            // Not on the main thread: the call waits while the node starts.
+            Thread({
+                runCatching { Tsbridge.networkChanged(ifName) }
+                wakeInjector()
+            }, "net-change").start()
+        } else {
+            wakeInjector()
+        }
+    }
+
+    @Volatile private var netEventAlways = false
+    private var lastNetState = ""
+
+    private fun onNetworkEvent(always: Boolean) {
+        if (always) netEventAlways = true
+        main.removeCallbacks(networkSettled)
+        main.postDelayed(networkSettled, NET_SETTLE_MS)
+    }
+
+    /** Interface of the default network, or "" when there is none. */
+    private fun defaultInterface(): String = runCatching {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        cm?.getLinkProperties(cm.activeNetwork)?.interfaceName
+    }.getOrNull() ?: ""
 
     /**
      * Turns TCP ADB back on when it can: Wireless debugging needs Wi-Fi, and
@@ -364,27 +442,49 @@ class BridgeService : Service() {
         }
         contentResolver.registerContentObserver(Settings.Global.getUriFor(Settings.Global.ADB_ENABLED), false, obs)
         adbObserver = obs
+
+        val unlock = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) = AdbKeeper.onUnlock(this@BridgeService)
+        }
+        runCatching {
+            val filter = IntentFilter(Intent.ACTION_USER_PRESENT)
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(unlock, filter, Context.RECEIVER_NOT_EXPORTED)
+            else registerReceiver(unlock, filter)
+            unlockReceiver = unlock
+        }
     }
 
     // ---- teardown -----------------------------------------------------------
 
-    private fun stopBridge() {
+    /**
+     * Stops the bridge. Only a [requested] stop is recorded as intentional.
+     * After any other stop the settings still say the bridge should run, so
+     * the watchdog, a reboot or opening the app starts it again.
+     */
+    private fun stopBridge(requested: Boolean) {
+        if (requested) {
+            cfg.enabled = false
+            cfg.cleanStop = true
+            Watchdog.cancel(this)
+            Attention.cancel(this, Attention.BRIDGE)
+        }
+        if (!alive) return
         alive = false
         isRunning = false
         linkUpNow = false
         activePort = 0
-        cfg.enabled = false
-        cfg.cleanStop = true
-        netCallback?.let { cb ->
+        netCallbacks.forEach { cb ->
             runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) }
         }
-        netCallback = null
+        netCallbacks.clear()
         wifiCallback?.let { cb ->
             runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) }
         }
         wifiCallback = null
         adbObserver?.let { contentResolver.unregisterContentObserver(it) }
         adbObserver = null
+        unlockReceiver?.let { runCatching { unregisterReceiver(it) } }
+        unlockReceiver = null
         main.removeCallbacksAndMessages(null)
         wakeInjector()
         injectThread = null
@@ -407,10 +507,10 @@ class BridgeService : Service() {
     override fun onDestroy() {
         // cleanStop is set only by a requested stop. Otherwise the service
         // was ended from outside the app (Doze, memory pressure, a task killer).
-        if (::cfg.isInitialized && !cfg.cleanStop) {
-            EventLog.add("SERVICE DESTROYED while running - killed by the system")
+        if (::cfg.isInitialized) {
+            if (alive && !cfg.cleanStop) EventLog.add("SERVICE DESTROYED while running - killed by the system")
+            stopBridge(requested = false)
         }
-        if (::cfg.isInitialized) stopBridge()
         super.onDestroy()
     }
 
